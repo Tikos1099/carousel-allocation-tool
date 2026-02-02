@@ -159,11 +159,11 @@ def write_timeline_excel(
     flights_out: pd.DataFrame | None = None,
     *,
     color_mode: str = "category",
-    wide_color: str = "#F4B183",
-    narrow_color: str = "#A9D08E",
+    wide_color: str = "#D32F2F",
+    narrow_color: str = "#FFEBEE",
 ):
-    wide_color = _normalize_hex_color(wide_color, "#F4B183")
-    narrow_color = _normalize_hex_color(narrow_color, "#A9D08E")
+    wide_color = _normalize_hex_color(wide_color, "#D32F2F")
+    narrow_color = _normalize_hex_color(narrow_color, "#FFEBEE")
     color_mode = str(color_mode or "category").strip().lower()
     if color_mode not in ("category", "flight", "terminal"):
         color_mode = "category"
