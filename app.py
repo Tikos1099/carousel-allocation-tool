@@ -5,7 +5,7 @@ import re
 import unicodedata
 from pathlib import Path
 
-from allocator import CarouselCapacity, allocate_round_robin
+from allocator import CarouselCapacity, allocate_round_robin, size_extra_makeups
 from io_excel import write_summary_txt, write_summary_csv, write_timeline_excel
 
 BRAND_RED = "#D32F2F"
@@ -273,6 +273,35 @@ def _apply_cat_term_mapping(df: pd.DataFrame, cat_mapping: dict, term_mapping: d
         df = df.drop(columns=["_TerminalStd"])
 
     return df, warnings
+
+
+def _default_extra_caps_from_caps(caps: dict | None) -> tuple[int, int]:
+    if not caps:
+        return 8, 4
+    max_wide = max(int(c.wide) for c in caps.values())
+    max_narrow = max(int(c.narrow) for c in caps.values())
+    return max_wide, max_narrow
+
+
+def _build_extra_terms_and_defaults(
+    df_ready: pd.DataFrame,
+    carousels_mode: str | None,
+    caps_by_terminal: dict | None,
+    caps_manual: dict | None,
+) -> tuple[list[str], dict[str, tuple[int, int]]]:
+    if df_ready is None or "Terminal" not in df_ready.columns:
+        wide_def, nar_def = _default_extra_caps_from_caps(caps_manual)
+        return ["ALL"], {"ALL": (wide_def, nar_def)}
+
+    terminals = sorted([str(x).strip() for x in df_ready["Terminal"].dropna().unique().tolist()])
+    if carousels_mode == "file" and caps_by_terminal:
+        valid_terms = [t for t in terminals if t in caps_by_terminal]
+        defaults = {t: _default_extra_caps_from_caps(caps_by_terminal.get(t)) for t in valid_terms}
+        return valid_terms, defaults
+
+    wide_def, nar_def = _default_extra_caps_from_caps(caps_manual)
+    defaults = {t: (wide_def, nar_def) for t in terminals}
+    return terminals, defaults
 
 
 st.subheader("Etape 1 - Upload fichier vols")
@@ -741,6 +770,64 @@ if not carousels_confirmed:
 
 
 st.divider()
+st.subheader("Etape 6b - Capacity sizing (extras)")
+
+caps_by_terminal = st.session_state.get("caps_by_terminal")
+caps_manual = st.session_state.get("caps_manual")
+carousels_mode = st.session_state.get("carousels_mode")
+
+extra_terminals, extra_defaults = _build_extra_terms_and_defaults(
+    df_ready,
+    carousels_mode,
+    caps_by_terminal,
+    caps_manual,
+)
+
+extra_caps_by_terminal = {}
+if not extra_terminals:
+    st.info("Aucun terminal configure pour dimensionnement extra.")
+elif extra_terminals == ["ALL"]:
+    wide_def, nar_def = extra_defaults.get("ALL", (8, 4))
+    wide_val = st.number_input(
+        "Extra Wide capacity",
+        min_value=0,
+        value=int(wide_def),
+        step=1,
+        key="extra_wide_ALL",
+    )
+    nar_val = st.number_input(
+        "Extra Narrow capacity",
+        min_value=0,
+        value=int(nar_def),
+        step=1,
+        key="extra_narrow_ALL",
+    )
+    extra_caps_by_terminal["ALL"] = CarouselCapacity(int(wide_val), int(nar_val))
+else:
+    st.caption("Capacite standard des extra make-up par terminal.")
+    for term in extra_terminals:
+        wide_def, nar_def = extra_defaults.get(term, (8, 4))
+        cols = st.columns(2)
+        with cols[0]:
+            wide_val = st.number_input(
+                f"{term} - Wide capacity",
+                min_value=0,
+                value=int(wide_def),
+                step=1,
+                key=f"extra_wide_{term}",
+            )
+        with cols[1]:
+            nar_val = st.number_input(
+                f"{term} - Narrow capacity",
+                min_value=0,
+                value=int(nar_def),
+                step=1,
+                key=f"extra_narrow_{term}",
+            )
+        extra_caps_by_terminal[term] = CarouselCapacity(int(wide_val), int(nar_val))
+
+
+st.divider()
 st.subheader("Etape 7 - Run + outputs")
 
 color_mode_ui = st.session_state.get("color_mode_ui", "Par categorie")
@@ -831,14 +918,105 @@ if st.button("Run allocation", key="run_allocation"):
             "Count": int(len(unassigned_df)),
         })
 
+        timeline_readjusted = timeline_df.copy()
+        extra_columns = []
+        extra_summary_rows = []
+        extra_warnings = []
+
+        unassigned_no_capacity = unassigned_df[unassigned_df["UnassignedReason"] == "NO_CAPACITY"].copy()
+        processed_terms = set()
+
+        if len(unassigned_no_capacity) > 0 and extra_caps_by_terminal:
+            if "Terminal" in unassigned_no_capacity.columns:
+                grouped_terms = unassigned_no_capacity.groupby("Terminal")
+            else:
+                grouped_terms = [("ALL", unassigned_no_capacity)]
+
+            for term, df_term in grouped_terms:
+                processed_terms.add(term)
+                cap = extra_caps_by_terminal.get(term)
+                if cap is None:
+                    extra_warnings.append({
+                        "Type": "Extra sizing",
+                        "Message": f"Terminal sans capacite extra configuree: {term}",
+                        "Count": int(len(df_term)),
+                    })
+                    extra_summary_rows.append({
+                        "Terminal": term,
+                        "Nb extra makeups": 0,
+                        "Liste": "",
+                    })
+                    continue
+
+                k, extra_assigned, extra_timeline, extra_impossible = size_extra_makeups(
+                    flights=df_term,
+                    extra_capacity=cap,
+                    time_step_minutes=int(current_time_step),
+                    start_time=pd.Timestamp(start_time),
+                    end_time=pd.Timestamp(end_time),
+                )
+
+                if extra_impossible is not None and len(extra_impossible) > 0:
+                    extra_warnings.append({
+                        "Type": "Extra sizing",
+                        "Message": f"Vols impossibles pour extra ({term})",
+                        "Count": int(len(extra_impossible)),
+                    })
+
+                cols = [
+                    f"{term}-EXTRA{i}" if term != "ALL" else f"ALL-EXTRA{i}"
+                    for i in range(1, k + 1)
+                ]
+                if k > 0:
+                    extra_timeline = extra_timeline.reindex(timeline_df.index, fill_value="")
+                    extra_timeline = extra_timeline.reindex(
+                        columns=[f"EXTRA{i}" for i in range(1, k + 1)],
+                        fill_value="",
+                    )
+                    extra_timeline = extra_timeline.rename(columns={
+                        f"EXTRA{i}": cols[i - 1] for i in range(1, k + 1)
+                    })
+                    timeline_readjusted = pd.concat([timeline_readjusted, extra_timeline], axis=1)
+                    extra_columns.extend(cols)
+
+                extra_summary_rows.append({
+                    "Terminal": term,
+                    "Nb extra makeups": int(k),
+                    "Liste": ", ".join(cols),
+                })
+
+        if extra_caps_by_terminal:
+            for term in extra_caps_by_terminal.keys():
+                if term not in processed_terms:
+                    extra_summary_rows.append({
+                        "Terminal": term,
+                        "Nb extra makeups": 0,
+                        "Liste": "",
+                    })
+
+        if extra_summary_rows:
+            extra_summary_df = pd.DataFrame(extra_summary_rows)
+            extra_makeups_df = extra_summary_df[["Terminal", "Nb extra makeups"]].rename(
+                columns={"Nb extra makeups": "ExtraMakeupsNeeded"}
+            )
+        else:
+            extra_summary_df = pd.DataFrame(columns=["Terminal", "Nb extra makeups", "Liste"])
+            extra_makeups_df = pd.DataFrame(columns=["Terminal", "ExtraMakeupsNeeded"])
+
+        warnings_rows.extend(extra_warnings)
+
         st.session_state["results"] = {
             "flights_out": flights_out,
             "timeline_df": timeline_df,
+            "timeline_readjusted": timeline_readjusted,
             "warnings_rows": warnings_rows,
             "unassigned_df": unassigned_df,
             "color_mode": color_mode,
             "wide_color": wide_color,
             "narrow_color": narrow_color,
+            "extra_columns": extra_columns,
+            "extra_summary_df": extra_summary_df,
+            "extra_makeups_df": extra_makeups_df,
         }
         st.session_state["run_done"] = True
         st.rerun()
@@ -850,8 +1028,12 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
     results = st.session_state["results"]
     flights_out = results["flights_out"]
     timeline_df = results["timeline_df"]
+    timeline_readjusted = results.get("timeline_readjusted", timeline_df)
     warnings_rows = results["warnings_rows"]
     unassigned_df = results["unassigned_df"]
+    extra_columns = results.get("extra_columns", [])
+    extra_summary_df = results.get("extra_summary_df")
+    extra_makeups_df = results.get("extra_makeups_df")
 
     total = int(len(flights_out))
     unassigned_count = int(len(unassigned_df))
@@ -890,11 +1072,17 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
 
     st.dataframe(filtered.sort_values("DepartureTime"), use_container_width=True)
 
+    if extra_summary_df is not None and len(extra_summary_df) > 0:
+        st.subheader("Summary extra makeups")
+        st.dataframe(extra_summary_df, use_container_width=True)
+
     import tempfile, os
     tmpdir = tempfile.mkdtemp()
     txt_path = os.path.join(tmpdir, "summary.txt")
     csv_path = os.path.join(tmpdir, "summary.csv")
     xlsx_path = os.path.join(tmpdir, "timeline.xlsx")
+    readjusted_path = os.path.join(tmpdir, "timeline_readjusted.xlsx")
+    extra_csv_path = os.path.join(tmpdir, "extra_makeups_needed.csv")
 
     write_summary_txt(txt_path, flights_out)
     write_summary_csv(csv_path, flights_out)
@@ -906,24 +1094,82 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
         wide_color=results["wide_color"],
         narrow_color=results["narrow_color"],
     )
+    write_timeline_excel(
+        readjusted_path,
+        timeline_readjusted,
+        flights_out,
+        color_mode=results["color_mode"],
+        wide_color=results["wide_color"],
+        narrow_color=results["narrow_color"],
+        extra_columns=extra_columns,
+        extra_summary=extra_summary_df,
+    )
 
-    download_cols = st.columns(4)
-    download_cols[0].download_button("summary.csv", data=open(csv_path, "rb"), file_name="summary.csv")
-    download_cols[1].download_button("summary.txt", data=open(txt_path, "rb"), file_name="summary.txt")
-    download_cols[2].download_button("timeline.xlsx", data=open(xlsx_path, "rb"), file_name="timeline.xlsx")
+    if extra_makeups_df is not None:
+        extra_makeups_df.to_csv(extra_csv_path, index=False, encoding="utf-8")
+    else:
+        pd.DataFrame(columns=["Terminal", "ExtraMakeupsNeeded"]).to_csv(extra_csv_path, index=False, encoding="utf-8")
+
+    st.subheader("Downloads")
+    st.markdown("**Resultats principaux**")
+    main_cols = st.columns(3)
+    main_cols[0].download_button(
+        "summary.csv",
+        data=open(csv_path, "rb"),
+        file_name="summary.csv",
+        key="dl_summary_csv",
+    )
+    main_cols[1].download_button(
+        "summary.txt",
+        data=open(txt_path, "rb"),
+        file_name="summary.txt",
+        key="dl_summary_txt",
+    )
+    main_cols[2].download_button(
+        "extra_makeups_needed.csv",
+        data=open(extra_csv_path, "rb"),
+        file_name="extra_makeups_needed.csv",
+        key="dl_extra_makeups_needed",
+    )
+
+    st.markdown("**Planning**")
+    plan_cols = st.columns(3)
+    plan_cols[0].download_button(
+        "timeline.xlsx",
+        data=open(xlsx_path, "rb"),
+        file_name="timeline.xlsx",
+        key="dl_timeline",
+    )
+    plan_cols[1].download_button(
+        "timeline_readjusted.xlsx",
+        data=open(readjusted_path, "rb"),
+        file_name="timeline_readjusted.xlsx",
+        key="dl_timeline_readjusted",
+    )
+
+    st.markdown("**Diagnostics**")
+    diag_cols = st.columns(3)
     if len(unassigned_df) > 0:
         unassigned_csv = unassigned_df.to_csv(index=False, encoding="utf-8")
-        download_cols[3].download_button(
+        diag_cols[0].download_button(
             "unassigned_reasons.csv",
             data=unassigned_csv,
             file_name="unassigned_reasons.csv",
+            key="dl_unassigned_reasons",
         )
     else:
-        download_cols[3].download_button(
+        diag_cols[0].download_button(
             "unassigned_reasons.csv",
             data="",
             file_name="unassigned_reasons.csv",
+            key="dl_unassigned_reasons",
         )
+    diag_cols[1].download_button(
+        "warnings.csv",
+        data=pd.DataFrame(warnings_rows).to_csv(index=False, encoding="utf-8") if warnings_rows else "",
+        file_name="warnings.csv",
+        key="dl_warnings_diag",
+    )
 
     if show_warnings:
         st.subheader("Warnings")
@@ -935,6 +1181,7 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
                 "warnings.csv",
                 data=warnings_csv,
                 file_name="warnings.csv",
+                key="dl_warnings_panel",
             )
         else:
             st.success("Aucun warning.")

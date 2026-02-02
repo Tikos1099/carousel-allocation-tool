@@ -8,6 +8,21 @@ class CarouselCapacity:
     wide: int
     narrow: int
 
+def _max_capacity_limits(carousel_caps: Dict[str, CarouselCapacity]) -> Tuple[int, int]:
+    if not carousel_caps:
+        return 0, 0
+    max_wide_total = max(cap.wide + cap.narrow for cap in carousel_caps.values())
+    max_narrow = max(cap.narrow for cap in carousel_caps.values())
+    return max_wide_total, max_narrow
+
+def _is_impossible_demand(category: str, positions: int, max_wide_total: int, max_narrow: int) -> bool:
+    category = str(category).strip().lower()
+    if category == "wide":
+        return positions > max_wide_total
+    if category == "narrow":
+        return positions > max_narrow
+    raise ValueError(f"Unknown category: {category} (expected 'Wide' or 'Narrow')")
+
 def _can_fit(category: str, positions: int, free_wide: int, free_narrow: int) -> bool:
     """
     Wide can use wide first then narrow overflow.
@@ -57,6 +72,8 @@ def allocate_round_robin(
     """
     if time_step_minutes <= 0:
         raise ValueError("time_step_minutes must be > 0")
+
+    max_wide_total, max_narrow = _max_capacity_limits(carousel_caps)
 
     # timeline
     timeline = pd.date_range(start=start_time, end=end_time, freq=f"{time_step_minutes}min")
@@ -108,6 +125,12 @@ def allocate_round_robin(
             cat = str(row[category_col]).strip().lower()
             pos = int(row[pos_col])
             close_t = pd.Timestamp(row[close_col])
+
+            if _is_impossible_demand(cat, pos, max_wide_total, max_narrow):
+                flights.loc[pending_idx, "AssignedCarousel"] = "UNASSIGNED"
+                flights.loc[pending_idx, "UnassignedReason"] = "IMPOSSIBLE_DEMAND"
+                pending_idx += 1
+                continue
 
             # Try carousels starting from rr_idx (round robin)
             assigned = None
@@ -161,3 +184,80 @@ def allocate_round_robin(
     # restore original row order
     flights_out = flights.sort_values("_rowid").drop(columns=["_rowid"]).reset_index(drop=True)
     return flights_out, timeline_df
+
+def size_extra_makeups(
+    flights: pd.DataFrame,
+    extra_capacity: CarouselCapacity,
+    time_step_minutes: int,
+    start_time: pd.Timestamp,
+    end_time: pd.Timestamp,
+    *,
+    category_col="Category",
+    pos_col="Positions",
+    open_col="MakeupOpening",
+    close_col="MakeupClosing",
+    dep_col="DepartureTime",
+) -> Tuple[int, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      - k: number of extra makeups needed
+      - assigned_flights: flights assigned to EXTRA* (AssignedCarousel filled)
+      - timeline_df: timeline for EXTRA* carousels
+      - impossible_flights: flights that cannot fit in extra_capacity
+    """
+    if flights is None or len(flights) == 0:
+        timeline_index = pd.date_range(start=start_time, end=end_time, freq=f"{time_step_minutes}min")
+        empty_timeline = pd.DataFrame(index=timeline_index)
+        empty_df = flights.copy() if flights is not None else pd.DataFrame()
+        return 0, empty_df, empty_timeline, empty_df.iloc[0:0]
+
+    max_wide_total = int(extra_capacity.wide) + int(extra_capacity.narrow)
+    max_narrow = int(extra_capacity.narrow)
+
+    feasible_rows = []
+    impossible_rows = []
+    for _, row in flights.iterrows():
+        cat = str(row.get(category_col, "")).strip().lower()
+        pos = int(row.get(pos_col, 0))
+        if _is_impossible_demand(cat, pos, max_wide_total, max_narrow):
+            r = row.copy()
+            r["AssignedCarousel"] = "UNASSIGNED"
+            r["UnassignedReason"] = "IMPOSSIBLE_DEMAND"
+            impossible_rows.append(r)
+        else:
+            feasible_rows.append(row)
+
+    feasible = pd.DataFrame(feasible_rows) if feasible_rows else flights.iloc[0:0].copy()
+    impossible = pd.DataFrame(impossible_rows) if impossible_rows else flights.iloc[0:0].copy()
+
+    timeline_index = pd.date_range(start=start_time, end=end_time, freq=f"{time_step_minutes}min")
+    if feasible.empty:
+        empty_timeline = pd.DataFrame(index=timeline_index)
+        return 0, feasible, empty_timeline, impossible
+
+    max_k = len(feasible)
+    last_out = feasible.copy()
+    last_timeline = pd.DataFrame(index=timeline_index)
+    for k in range(1, max_k + 1):
+        caps = {
+            f"EXTRA{i}": CarouselCapacity(wide=int(extra_capacity.wide), narrow=int(extra_capacity.narrow))
+            for i in range(1, k + 1)
+        }
+        out, timeline_df = allocate_round_robin(
+            flights=feasible,
+            carousel_caps=caps,
+            time_step_minutes=time_step_minutes,
+            start_time=start_time,
+            end_time=end_time,
+            category_col=category_col,
+            pos_col=pos_col,
+            open_col=open_col,
+            close_col=close_col,
+            dep_col=dep_col,
+        )
+        last_out = out
+        last_timeline = timeline_df
+        if (out["AssignedCarousel"] != "UNASSIGNED").all():
+            return k, out, timeline_df, impossible
+
+    return max_k, last_out, last_timeline, impossible

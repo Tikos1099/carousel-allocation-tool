@@ -161,6 +161,11 @@ def write_timeline_excel(
     color_mode: str = "category",
     wide_color: str = "#D32F2F",
     narrow_color: str = "#FFEBEE",
+    extra_columns: list[str] | None = None,
+    extra_header_color: str = "#E6DFF7",
+    extra_border_color: str = "#8064A2",
+    extra_summary: pd.DataFrame | None = None,
+    extra_sheet_name: str = "Summary extra makeups",
 ):
     wide_color = _normalize_hex_color(wide_color, "#D32F2F")
     narrow_color = _normalize_hex_color(narrow_color, "#FFEBEE")
@@ -168,11 +173,19 @@ def write_timeline_excel(
     if color_mode not in ("category", "flight", "terminal"):
         color_mode = "category"
 
+    extra_columns = extra_columns or []
+    extra_columns_set = set(extra_columns)
+    extra_header_color = _normalize_hex_color(extra_header_color, "#E6DFF7")
+    extra_border_color = _normalize_hex_color(extra_border_color, "#8064A2")
+
     with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
         out = timeline_df.copy()
         out.insert(0, "Timestamp", out.index)
         out.insert(1, "Legend / Filter", "")
         out.to_excel(writer, index=False, sheet_name="Planning")
+
+        if extra_summary is not None:
+            extra_summary.to_excel(writer, index=False, sheet_name=extra_sheet_name)
 
         workbook = writer.book
         worksheet = writer.sheets["Planning"]
@@ -180,6 +193,13 @@ def write_timeline_excel(
         header_format = workbook.add_format({
             "bold": True,
             "bg_color": "#D9D9D9",
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+        })
+        header_format_extra = workbook.add_format({
+            "bold": True,
+            "bg_color": extra_header_color,
             "border": 1,
             "align": "center",
             "valign": "vcenter",
@@ -192,22 +212,28 @@ def write_timeline_excel(
             worksheet.set_column(2, out.shape[1] - 1, 18)
 
         for col_idx, col_name in enumerate(out.columns):
-            worksheet.write(0, col_idx, col_name, header_format)
+            fmt = header_format_extra if col_name in extra_columns_set else header_format
+            worksheet.write(0, col_idx, col_name, fmt)
 
         worksheet.freeze_panes(1, 2)
 
         fill_cache: dict[str, object] = {}
         legend_cache: dict[str, object] = {}
 
-        def _fill(color: str):
-            if color not in fill_cache:
-                fill_cache[color] = workbook.add_format({
+        def _fill(color: str, is_extra: bool):
+            key = f"{color}|extra" if is_extra else color
+            if key not in fill_cache:
+                fmt = {
                     "bg_color": color,
                     "border": 1,
                     "text_wrap": True,
                     "valign": "top",
-                })
-            return fill_cache[color]
+                }
+                if is_extra:
+                    fmt["border"] = 2
+                    fmt["border_color"] = extra_border_color
+                fill_cache[key] = workbook.add_format(fmt)
+            return fill_cache[key]
 
         def _legend(color: str):
             if color not in legend_cache:
@@ -270,6 +296,7 @@ def write_timeline_excel(
             for row_idx in range(len(timeline_df)):
                 for col_idx in range(len(timeline_df.columns)):
                     cell_value = timeline_df.iat[row_idx, col_idx]
+                    is_extra = timeline_df.columns[col_idx] in extra_columns_set
                     flights = _extract_flights(cell_value)
                     if not flights:
                         continue
@@ -283,9 +310,9 @@ def write_timeline_excel(
                         if cat == "narrow":
                             has_narrow = True
                     if has_wide:
-                        fmt = _fill(wide_color)
+                        fmt = _fill(wide_color, is_extra)
                     elif has_narrow:
-                        fmt = _fill(narrow_color)
+                        fmt = _fill(narrow_color, is_extra)
                     else:
                         continue
                     worksheet.write(row_idx + 1, col_idx + 2, str(cell_value), fmt)
@@ -309,6 +336,7 @@ def write_timeline_excel(
             for row_idx in range(len(timeline_df)):
                 for col_idx in range(len(timeline_df.columns)):
                     cell_value = timeline_df.iat[row_idx, col_idx]
+                    is_extra = timeline_df.columns[col_idx] in extra_columns_set
                     flights = _extract_flights(cell_value)
                     if not flights:
                         continue
@@ -322,7 +350,7 @@ def write_timeline_excel(
                     color = terminal_color.get(term) if term else None
                     if not color:
                         continue
-                    fmt = _fill(color)
+                    fmt = _fill(color, is_extra)
                     worksheet.write(row_idx + 1, col_idx + 2, str(cell_value), fmt)
         else:
             palette = [
@@ -343,11 +371,12 @@ def write_timeline_excel(
             for row_idx in range(len(timeline_df)):
                 for col_idx in range(len(timeline_df.columns)):
                     cell_value = timeline_df.iat[row_idx, col_idx]
+                    is_extra = timeline_df.columns[col_idx] in extra_columns_set
                     flights = _extract_flights(cell_value)
                     if not flights:
                         continue
                     color = flight_color.get(flights[0])
                     if not color:
                         continue
-                    fmt = _fill(color)
+                    fmt = _fill(color, is_extra)
                     worksheet.write(row_idx + 1, col_idx + 2, str(cell_value), fmt)
