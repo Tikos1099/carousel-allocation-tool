@@ -65,6 +65,9 @@ st.markdown(
             color: #ffffff;
             border: 0;
         }}
+        div.stButton > button * , div.stDownloadButton > button * {{
+            color: #ffffff !important;
+        }}
         div.stButton > button:hover, div.stDownloadButton > button:hover {{
             background: var(--brand-red-dark);
             color: #ffffff;
