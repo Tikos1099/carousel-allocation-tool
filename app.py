@@ -24,6 +24,10 @@ st.markdown(
             --brand-bg: {BRAND_BG};
             --brand-sidebar: {BRAND_SIDEBAR};
             --brand-border: {BRAND_BORDER};
+            --primary-color: var(--brand-red);
+            --secondary-background-color: var(--brand-sidebar);
+            --background-color: var(--brand-bg);
+            --text-color: #111111;
         }}
         html, body, [data-testid="stAppViewContainer"] {{
             background: var(--brand-bg);
@@ -49,6 +53,16 @@ st.markdown(
             background: #ffffff !important;
             color: #111111 !important;
             border: 1px solid var(--brand-border) !important;
+        }}
+        input:focus, textarea:focus, [data-baseweb="select"] > div:focus-within {{
+            border-color: var(--brand-red) !important;
+            box-shadow: 0 0 0 2px rgba(211, 47, 47, 0.2);
+        }}
+        input[type="radio"], input[type="checkbox"], input[type="range"] {{
+            accent-color: var(--brand-red);
+        }}
+        :focus-visible {{
+            outline-color: var(--brand-red) !important;
         }}
         [data-testid="stFileUploader"] section {{
             background: #ffffff !important;
@@ -421,7 +435,6 @@ else:
         st.stop()
 
     st.success("Mapping colonnes confirme.")
-    st.write("Colonnes mappees :", list(col_mapping.values()))
     if st.button("Modifier mapping colonnes", key="modify_mapping_cols"):
         st.session_state["mapping_confirmed"] = False
         _reset_after_mapping()
@@ -527,10 +540,6 @@ if not cat_mapping:
 term_mapping = st.session_state.get("term_mapping", {})
 df_std, mapping_warnings = _apply_cat_term_mapping(df_mapped, cat_mapping, term_mapping)
 
-st.write("Categories standard :", sorted(df_std["Category"].unique().tolist()))
-if "Terminal" in df_std.columns:
-    st.write("Terminals standard :", sorted(df_std["Terminal"].unique().tolist()))
-
 
 st.divider()
 st.subheader("Etape 4 - Make-up times")
@@ -579,7 +588,6 @@ if len(bad_times) > 0:
     })
 
 if not makeup_confirmed:
-    st.write(f"Mode make-up selectionne : {makeup_mode}")
     if st.button("Confirmer make-up times", key="confirm_makeup"):
         st.session_state["makeup_confirmed"] = True
         st.session_state["makeup_signature"] = current_signature
@@ -607,7 +615,6 @@ if time_step_confirmed and st.session_state.get("time_step_value") != current_ti
     _reset_after_time_step()
     time_step_confirmed = False
 
-st.write(f"Pas de temps actuel : {current_time_step} minutes")
 if not time_step_confirmed:
     if st.button("Confirmer time step", key="confirm_time_step"):
         st.session_state["time_step_confirmed"] = True
