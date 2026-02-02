@@ -85,6 +85,65 @@ def _build_flight_category_map(flights_out: pd.DataFrame) -> dict[str, str]:
             mapping[flight] = cat
     return mapping
 
+def _format_category_short(category_value) -> str:
+    s = str(category_value or "").strip().lower()
+    if s in ("wide", "w"):
+        return "W"
+    if s in ("narrow", "n"):
+        return "N"
+    if not s or s == "nan":
+        return "?"
+    return s.upper()
+
+def _format_positions_value(positions_value) -> str:
+    if positions_value is None:
+        return "?"
+    try:
+        if pd.isna(positions_value):
+            return "?"
+    except Exception:
+        pass
+    s = str(positions_value).strip()
+    if not s or s.lower() == "nan":
+        return "?"
+    try:
+        f = float(positions_value)
+        if f.is_integer():
+            return str(int(f))
+        return str(f)
+    except Exception:
+        return s
+
+def _build_flight_info_map(flights_out: pd.DataFrame) -> dict[str, tuple[object, object]]:
+    mapping: dict[str, tuple[object, object]] = {}
+    if flights_out is None:
+        return mapping
+    if "FlightNumber" not in flights_out.columns:
+        return mapping
+    for _, row in flights_out.iterrows():
+        flight = str(row.get("FlightNumber", "")).strip()
+        if not flight or flight.lower() == "nan" or flight in mapping:
+            continue
+        mapping[flight] = (row.get("Category"), row.get("Positions"))
+    return mapping
+
+def _format_flight_with_info(flight: str, info_map: dict[str, tuple[object, object]]) -> str:
+    flight = str(flight or "").strip()
+    if not flight:
+        return ""
+    if not info_map:
+        return flight
+    info = info_map.get(flight)
+    if info is None:
+        return flight
+    cat_value, pos_value = info
+    cat = _format_category_short(cat_value)
+    pos = _format_positions_value(pos_value)
+    return f"{flight} ( C= {cat} P={pos})"
+
+def _format_flight_cell(flights: list[str], info_map: dict[str, tuple[object, object]]) -> str:
+    return ", ".join(_format_flight_with_info(flight, info_map) for flight in flights)
+
 def _build_flight_terminal_map(flights_out: pd.DataFrame) -> dict[str, str]:
     mapping: dict[str, str] = {}
     if flights_out is None:
@@ -177,6 +236,7 @@ def write_timeline_excel(
     extra_columns_set = set(extra_columns)
     extra_header_color = _normalize_hex_color(extra_header_color, "#E6DFF7")
     extra_border_color = _normalize_hex_color(extra_border_color, "#8064A2")
+    flight_info = _build_flight_info_map(flights_out)
 
     with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
         out = timeline_df.copy()
@@ -300,6 +360,7 @@ def write_timeline_excel(
                     flights = _extract_flights(cell_value)
                     if not flights:
                         continue
+                    display_value = _format_flight_cell(flights, flight_info)
                     has_wide = False
                     has_narrow = False
                     for flight in flights:
@@ -314,8 +375,11 @@ def write_timeline_excel(
                     elif has_narrow:
                         fmt = _fill(narrow_color, is_extra)
                     else:
-                        continue
-                    worksheet.write(row_idx + 1, col_idx + 2, str(cell_value), fmt)
+                        fmt = None
+                    if fmt:
+                        worksheet.write(row_idx + 1, col_idx + 2, display_value, fmt)
+                    else:
+                        worksheet.write(row_idx + 1, col_idx + 2, display_value)
         elif color_mode == "terminal":
             palette = [
                 "#F8CBAD",
@@ -340,6 +404,7 @@ def write_timeline_excel(
                     flights = _extract_flights(cell_value)
                     if not flights:
                         continue
+                    display_value = _format_flight_cell(flights, flight_info)
                     term = None
                     for flight in flights:
                         term = flight_terminal.get(flight)
@@ -348,10 +413,11 @@ def write_timeline_excel(
                     if not term:
                         term = _extract_terminal_from_column(timeline_df.columns[col_idx])
                     color = terminal_color.get(term) if term else None
-                    if not color:
-                        continue
-                    fmt = _fill(color, is_extra)
-                    worksheet.write(row_idx + 1, col_idx + 2, str(cell_value), fmt)
+                    fmt = _fill(color, is_extra) if color else None
+                    if fmt:
+                        worksheet.write(row_idx + 1, col_idx + 2, display_value, fmt)
+                    else:
+                        worksheet.write(row_idx + 1, col_idx + 2, display_value)
         else:
             palette = [
                 "#F8CBAD",
@@ -375,8 +441,10 @@ def write_timeline_excel(
                     flights = _extract_flights(cell_value)
                     if not flights:
                         continue
+                    display_value = _format_flight_cell(flights, flight_info)
                     color = flight_color.get(flights[0])
-                    if not color:
-                        continue
-                    fmt = _fill(color, is_extra)
-                    worksheet.write(row_idx + 1, col_idx + 2, str(cell_value), fmt)
+                    fmt = _fill(color, is_extra) if color else None
+                    if fmt:
+                        worksheet.write(row_idx + 1, col_idx + 2, display_value, fmt)
+                    else:
+                        worksheet.write(row_idx + 1, col_idx + 2, display_value)
