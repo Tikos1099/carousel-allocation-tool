@@ -51,6 +51,65 @@ def _consume(category: str, positions: int, free_wide: int, free_narrow: int) ->
     use_narrow = rem
     return free_wide - use_wide, free_narrow - use_narrow
 
+def _build_timeline_from_assignments(
+    flights_out: pd.DataFrame,
+    carousels: List[str],
+    time_step_minutes: int,
+    start_time: pd.Timestamp,
+    end_time: pd.Timestamp,
+    *,
+    open_col="MakeupOpening",
+    close_col="MakeupClosing",
+    flight_col="FlightNumber",
+) -> pd.DataFrame:
+    if time_step_minutes <= 0:
+        raise ValueError("time_step_minutes must be > 0")
+
+    timeline_index = pd.date_range(start=start_time, end=end_time, freq=f"{time_step_minutes}min")
+    timeline_df = pd.DataFrame(index=timeline_index, columns=carousels, data="")
+
+    if flights_out is None or len(flights_out) == 0 or not carousels:
+        return timeline_df
+
+    cell_lists = {c: [[] for _ in range(len(timeline_index))] for c in carousels}
+
+    for _, row in flights_out.iterrows():
+        assigned = row.get("AssignedCarousel")
+        if assigned not in cell_lists:
+            continue
+
+        open_t = pd.Timestamp(row.get(open_col))
+        close_t = pd.Timestamp(row.get(close_col))
+        if pd.isna(open_t) or pd.isna(close_t):
+            continue
+        if close_t <= open_t:
+            continue
+
+        flight = row.get(flight_col)
+        if flight is None:
+            flight = row.get("Flight number", "")
+        flight = str(flight).strip()
+        if not flight or flight.lower() == "nan":
+            continue
+
+        # Map to step intervals [t_i, t_{i+1}) so we include any overlap with [open, close).
+        start_idx = timeline_index.searchsorted(open_t, side="right") - 1
+        end_idx = timeline_index.searchsorted(close_t, side="left")
+        if start_idx < 0:
+            start_idx = 0
+        if end_idx > len(timeline_index):
+            end_idx = len(timeline_index)
+        if start_idx >= end_idx:
+            continue
+
+        for i in range(start_idx, end_idx):
+            cell_lists[assigned][i].append(flight)
+
+    for c in carousels:
+        timeline_df[c] = [", ".join(items) if items else "" for items in cell_lists[c]]
+
+    return timeline_df
+
 def allocate_round_robin(
     flights: pd.DataFrame,
     carousel_caps: Dict[str, CarouselCapacity],
@@ -63,6 +122,7 @@ def allocate_round_robin(
     open_col="MakeupOpening",
     close_col="MakeupClosing",
     dep_col="DepartureTime",
+    flight_col="FlightNumber",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     flights must contain: dep_col, category_col, pos_col, open_col, close_col.
@@ -75,9 +135,30 @@ def allocate_round_robin(
 
     max_wide_total, max_narrow = _max_capacity_limits(carousel_caps)
 
-    # timeline
-    timeline = pd.date_range(start=start_time, end=end_time, freq=f"{time_step_minutes}min")
     carousels = list(carousel_caps.keys())
+
+    flights = flights.copy()
+    flights["AssignedCarousel"] = None
+    flights["UnassignedReason"] = ""
+    # Sort flights by opening time then departure time for stable behavior
+    flights = flights.sort_values([open_col, dep_col]).reset_index(drop=False).rename(columns={"index": "_rowid"})
+
+    if not carousels:
+        flights["AssignedCarousel"] = "UNASSIGNED"
+        flights["UnassignedReason"] = "NO_CAPACITY"
+        flights_out = flights.sort_values("_rowid").drop(columns=["_rowid"]).reset_index(drop=True)
+        timeline_df = _build_timeline_from_assignments(
+            flights_out,
+            carousels,
+            time_step_minutes,
+            start_time,
+            end_time,
+            open_col=open_col,
+            close_col=close_col,
+            flight_col=flight_col,
+        )
+        return flights_out, timeline_df
+
     # occupancy tracking per carousel: store active flights with closing time and their consumed capacity
     active = {c: [] for c in carousels}  # list of dicts: {flight_id, close, cat, pos, wide_used, narrow_used}
     # free capacity at each carousel (mutable current state)
@@ -85,12 +166,6 @@ def allocate_round_robin(
         c: {"wide": carousel_caps[c].wide, "narrow": carousel_caps[c].narrow}
         for c in carousels
     }
-
-    flights = flights.copy()
-    flights["AssignedCarousel"] = None
-    flights["UnassignedReason"] = ""
-    # Sort flights by opening time then departure time for stable behavior
-    flights = flights.sort_values([open_col, dep_col]).reset_index(drop=False).rename(columns={"index": "_rowid"})
 
     rr_idx = 0  # round-robin pointer
 
@@ -107,82 +182,69 @@ def allocate_round_robin(
                     still.append(item)
             active[c] = still
 
-    # timeline cells store list of flight numbers (string)
-    timeline_df = pd.DataFrame(index=timeline, columns=carousels, data="")
+    for idx in range(len(flights)):
+        row = flights.loc[idx]
+        open_t = pd.Timestamp(row[open_col])
+        close_t = pd.Timestamp(row[close_col])
 
-    # We allocate flights when t reaches their opening time.
-    # We'll iterate timestamps and assign flights whose opening is within (prev, t].
-    prev_t = timeline[0] - pd.Timedelta(minutes=time_step_minutes)
-    pending_idx = 0
+        # release capacities at opening time
+        release_until(open_t)
 
-    for t in timeline:
-        # release capacities at time t
-        release_until(t)
+        cat = str(row[category_col]).strip().lower()
+        pos = int(row[pos_col])
 
-        # allocate flights that become active by time t (opening <= t)
-        while pending_idx < len(flights) and pd.Timestamp(flights.loc[pending_idx, open_col]) <= t:
-            row = flights.loc[pending_idx]
-            cat = str(row[category_col]).strip().lower()
-            pos = int(row[pos_col])
-            close_t = pd.Timestamp(row[close_col])
+        if _is_impossible_demand(cat, pos, max_wide_total, max_narrow):
+            flights.loc[idx, "AssignedCarousel"] = "UNASSIGNED"
+            flights.loc[idx, "UnassignedReason"] = "IMPOSSIBLE_DEMAND"
+            continue
 
-            if _is_impossible_demand(cat, pos, max_wide_total, max_narrow):
-                flights.loc[pending_idx, "AssignedCarousel"] = "UNASSIGNED"
-                flights.loc[pending_idx, "UnassignedReason"] = "IMPOSSIBLE_DEMAND"
-                pending_idx += 1
-                continue
+        # Try carousels starting from rr_idx (round robin)
+        assigned = None
+        tried = 0
+        while tried < len(carousels):
+            c = carousels[(rr_idx + tried) % len(carousels)]
+            fw, fn = free[c]["wide"], free[c]["narrow"]
+            if _can_fit(cat, pos, fw, fn):
+                # consume
+                new_fw, new_fn = _consume(cat, pos, fw, fn)
+                wide_used = fw - new_fw
+                narrow_used = fn - new_fn
+                free[c]["wide"], free[c]["narrow"] = new_fw, new_fn
+                active[c].append({
+                    "rowid": row["_rowid"],
+                    "flight": str(row.get(flight_col, row.get("Flight number", ""))),
+                    "close": close_t,
+                    "cat": cat,
+                    "pos": pos,
+                    "wide_used": wide_used,
+                    "narrow_used": narrow_used,
+                })
+                assigned = c
+                rr_idx = (rr_idx + tried + 1) % len(carousels)  # next start after the chosen one
+                break
+            tried += 1
 
-            # Try carousels starting from rr_idx (round robin)
-            assigned = None
-            tried = 0
-            while tried < len(carousels):
-                c = carousels[(rr_idx + tried) % len(carousels)]
-                fw, fn = free[c]["wide"], free[c]["narrow"]
-                if _can_fit(cat, pos, fw, fn):
-                    # consume
-                    new_fw, new_fn = _consume(cat, pos, fw, fn)
-                    wide_used = fw - new_fw
-                    narrow_used = fn - new_fn
-                    free[c]["wide"], free[c]["narrow"] = new_fw, new_fn
-                    active[c].append({
-                        "rowid": row["_rowid"],
-                        "flight": str(row.get("FlightNumber", row.get("Flight number", ""))),
-                        "close": close_t,
-                        "cat": cat,
-                        "pos": pos,
-                        "wide_used": wide_used,
-                        "narrow_used": narrow_used,
-                    })
-                    assigned = c
-                    rr_idx = (rr_idx + tried + 1) % len(carousels)  # next start after the chosen one
-                    break
-                tried += 1
+        if assigned is None:
+            # no capacity anywhere at this time
+            assigned = "UNASSIGNED"
+            flights.loc[idx, "UnassignedReason"] = "NO_CAPACITY"
+        else:
+            flights.loc[idx, "UnassignedReason"] = ""
 
-            if assigned is None:
-                # no capacity anywhere at this time
-                assigned = "UNASSIGNED"
-                flights.loc[pending_idx, "UnassignedReason"] = "NO_CAPACITY"
-                
-            else:
-                flights.loc[pending_idx, "UnassignedReason"] = ""
-
-            flights.loc[pending_idx, "AssignedCarousel"] = assigned
-            pending_idx += 1
-
-        # Fill timeline grid at time t
-        for c in carousels:
-            # show flights that are active at t (open <= t < close)
-            names = []
-            for item in active[c]:
-                # active list already contains open<=t by construction; check close
-                if item["close"] > t:
-                    names.append(item["flight"])
-            timeline_df.loc[t, c] = ", ".join(names)
-
-        prev_t = t
+        flights.loc[idx, "AssignedCarousel"] = assigned
 
     # restore original row order
     flights_out = flights.sort_values("_rowid").drop(columns=["_rowid"]).reset_index(drop=True)
+    timeline_df = _build_timeline_from_assignments(
+        flights_out,
+        carousels,
+        time_step_minutes,
+        start_time,
+        end_time,
+        open_col=open_col,
+        close_col=close_col,
+        flight_col=flight_col,
+    )
     return flights_out, timeline_df
 
 def size_extra_makeups(
