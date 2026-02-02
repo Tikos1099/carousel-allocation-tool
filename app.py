@@ -307,19 +307,28 @@ if uploaded:
 
     st.divider()
     st.subheader("Etape 2bis -- Couleurs")
+    color_options = ["Par categorie", "Par vol"]
+    if "Terminal" in df.columns:
+        color_options.append("Par terminal")
     color_mode_ui = st.radio(
         "Mode couleur",
-        options=["Par categorie", "Par vol"],
+        options=color_options,
         index=0,
         horizontal=True,
     )
-    color_mode = "category" if color_mode_ui == "Par categorie" else "flight"
     wide_color_default = "#F4B183"
     narrow_color_default = "#A9D08E"
-    if color_mode == "category":
+    if color_mode_ui == "Par categorie":
+        color_mode = "category"
         wide_color = st.color_picker("Couleur Wide", value=wide_color_default)
         narrow_color = st.color_picker("Couleur Narrow", value=narrow_color_default)
+    elif color_mode_ui == "Par terminal":
+        color_mode = "terminal"
+        wide_color = wide_color_default
+        narrow_color = narrow_color_default
+        st.caption("Mode par terminal: couleurs automatiques basees sur le terminal.")
     else:
+        color_mode = "flight"
         wide_color = wide_color_default
         narrow_color = narrow_color_default
         st.caption("Mode par vol: couleurs automatiques basees sur le numero de vol.")

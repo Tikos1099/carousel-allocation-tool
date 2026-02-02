@@ -59,6 +59,17 @@ def _extract_flights(cell_value) -> list[str]:
         return []
     return [p.strip() for p in s.split(",") if p.strip()]
 
+def _extract_terminal_from_column(col_name) -> str | None:
+    if col_name is None:
+        return None
+    s = str(col_name).strip()
+    if not s or s.lower() == "nan":
+        return None
+    if "-" in s:
+        term = s.split("-", 1)[0].strip()
+        return term or None
+    return None
+
 def _build_flight_category_map(flights_out: pd.DataFrame) -> dict[str, str]:
     mapping: dict[str, str] = {}
     if flights_out is None:
@@ -72,6 +83,21 @@ def _build_flight_category_map(flights_out: pd.DataFrame) -> dict[str, str]:
         cat = str(row.get("Category", "")).strip().lower()
         if cat in ("wide", "narrow"):
             mapping[flight] = cat
+    return mapping
+
+def _build_flight_terminal_map(flights_out: pd.DataFrame) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    if flights_out is None:
+        return mapping
+    if "FlightNumber" not in flights_out.columns or "Terminal" not in flights_out.columns:
+        return mapping
+    for _, row in flights_out.iterrows():
+        flight = str(row.get("FlightNumber", "")).strip()
+        if not flight or flight.lower() == "nan" or flight in mapping:
+            continue
+        term = str(row.get("Terminal", "")).strip()
+        if term and term.lower() != "nan":
+            mapping[flight] = term
     return mapping
 
 def _build_flight_color_map(
@@ -100,6 +126,33 @@ def _build_flight_color_map(
         mapping[flight] = palette[idx % len(palette)]
     return mapping
 
+def _build_terminal_color_map(
+    flights_out: pd.DataFrame | None,
+    timeline_df: pd.DataFrame,
+    palette: list[str],
+) -> dict[str, str]:
+    terminals: list[str] = []
+    if flights_out is not None and "Terminal" in flights_out.columns:
+        terminals = [str(x).strip() for x in flights_out["Terminal"].dropna().tolist()]
+        terminals = [t for t in terminals if t and t.lower() != "nan"]
+    if not terminals:
+        for col in timeline_df.columns:
+            term = _extract_terminal_from_column(col)
+            if term:
+                terminals.append(term)
+
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for t in terminals:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+
+    mapping: dict[str, str] = {}
+    for idx, term in enumerate(sorted(uniq)):
+        mapping[term] = palette[idx % len(palette)]
+    return mapping
+
 def write_timeline_excel(
     path: str,
     timeline_df: pd.DataFrame,
@@ -112,7 +165,7 @@ def write_timeline_excel(
     wide_color = _normalize_hex_color(wide_color, "#F4B183")
     narrow_color = _normalize_hex_color(narrow_color, "#A9D08E")
     color_mode = str(color_mode or "category").strip().lower()
-    if color_mode not in ("category", "flight"):
+    if color_mode not in ("category", "flight", "terminal"):
         color_mode = "category"
 
     with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
@@ -143,15 +196,8 @@ def write_timeline_excel(
 
         worksheet.freeze_panes(1, 2)
 
-        legend_wide = workbook.add_format({"bg_color": wide_color, "border": 1, "bold": True})
-        legend_narrow = workbook.add_format({"bg_color": narrow_color, "border": 1, "bold": True})
-        worksheet.write(1, 1, "Wide", legend_wide)
-        worksheet.write(2, 1, "Narrow", legend_narrow)
-
-        if timeline_df.empty or len(timeline_df.columns) == 0:
-            return
-
         fill_cache: dict[str, object] = {}
+        legend_cache: dict[str, object] = {}
 
         def _fill(color: str):
             if color not in fill_cache:
@@ -162,6 +208,62 @@ def write_timeline_excel(
                     "valign": "top",
                 })
             return fill_cache[color]
+
+        def _legend(color: str):
+            if color not in legend_cache:
+                legend_cache[color] = workbook.add_format({
+                    "bg_color": color,
+                    "border": 1,
+                    "bold": True,
+                })
+            return legend_cache[color]
+
+        if color_mode == "category":
+            worksheet.write(1, 1, "Wide", _legend(wide_color))
+            worksheet.write(2, 1, "Narrow", _legend(narrow_color))
+        elif color_mode == "flight":
+            palette = [
+                "#F8CBAD",
+                "#C6E0B4",
+                "#BDD7EE",
+                "#FFE699",
+                "#D9D2E9",
+                "#B4C6E7",
+                "#F4B183",
+                "#A9D08E",
+                "#DDEBF7",
+                "#FFF2CC",
+                "#E2EFDA",
+                "#FCE4D6",
+            ]
+            flight_color = _build_flight_color_map(flights_out, timeline_df, palette)
+            row_ptr = 1
+            for flight in sorted(flight_color.keys()):
+                worksheet.write(row_ptr, 1, flight, _legend(flight_color[flight]))
+                row_ptr += 1
+        else:
+            palette = [
+                "#F8CBAD",
+                "#C6E0B4",
+                "#BDD7EE",
+                "#FFE699",
+                "#D9D2E9",
+                "#B4C6E7",
+                "#F4B183",
+                "#A9D08E",
+                "#DDEBF7",
+                "#FFF2CC",
+                "#E2EFDA",
+                "#FCE4D6",
+            ]
+            terminal_color = _build_terminal_color_map(flights_out, timeline_df, palette)
+            row_ptr = 1
+            for term in sorted(terminal_color.keys()):
+                worksheet.write(row_ptr, 1, term, _legend(terminal_color[term]))
+                row_ptr += 1
+
+        if timeline_df.empty or len(timeline_df.columns) == 0:
+            return
 
         if color_mode == "category":
             cat_map = _build_flight_category_map(flights_out)
@@ -186,6 +288,41 @@ def write_timeline_excel(
                         fmt = _fill(narrow_color)
                     else:
                         continue
+                    worksheet.write(row_idx + 1, col_idx + 2, str(cell_value), fmt)
+        elif color_mode == "terminal":
+            palette = [
+                "#F8CBAD",
+                "#C6E0B4",
+                "#BDD7EE",
+                "#FFE699",
+                "#D9D2E9",
+                "#B4C6E7",
+                "#F4B183",
+                "#A9D08E",
+                "#DDEBF7",
+                "#FFF2CC",
+                "#E2EFDA",
+                "#FCE4D6",
+            ]
+            terminal_color = _build_terminal_color_map(flights_out, timeline_df, palette)
+            flight_terminal = _build_flight_terminal_map(flights_out)
+            for row_idx in range(len(timeline_df)):
+                for col_idx in range(len(timeline_df.columns)):
+                    cell_value = timeline_df.iat[row_idx, col_idx]
+                    flights = _extract_flights(cell_value)
+                    if not flights:
+                        continue
+                    term = None
+                    for flight in flights:
+                        term = flight_terminal.get(flight)
+                        if term:
+                            break
+                    if not term:
+                        term = _extract_terminal_from_column(timeline_df.columns[col_idx])
+                    color = terminal_color.get(term) if term else None
+                    if not color:
+                        continue
+                    fmt = _fill(color)
                     worksheet.write(row_idx + 1, col_idx + 2, str(cell_value), fmt)
         else:
             palette = [
