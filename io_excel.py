@@ -1,4 +1,5 @@
 from __future__ import annotations
+import ast
 import pandas as pd
 import re
 
@@ -70,17 +71,29 @@ def _extract_terminal_from_column(col_name) -> str | None:
         return term or None
     return None
 
+def _extract_carousel_from_column(col_name) -> str | None:
+    if col_name is None:
+        return None
+    s = str(col_name).strip()
+    if not s or s.lower() == "nan":
+        return None
+    if "-" in s:
+        base = s.split("-", 1)[1].strip()
+        return base or None
+    return s
+
 def _build_flight_category_map(flights_out: pd.DataFrame) -> dict[str, str]:
     mapping: dict[str, str] = {}
     if flights_out is None:
         return mapping
-    if "FlightNumber" not in flights_out.columns or "Category" not in flights_out.columns:
+    category_col = "FinalCategory" if "FinalCategory" in flights_out.columns else "Category"
+    if "FlightNumber" not in flights_out.columns or category_col not in flights_out.columns:
         return mapping
     for _, row in flights_out.iterrows():
         flight = str(row.get("FlightNumber", "")).strip()
         if not flight or flight.lower() == "nan" or flight in mapping:
             continue
-        cat = str(row.get("Category", "")).strip().lower()
+        cat = str(row.get(category_col, "")).strip().lower()
         if cat in ("wide", "narrow"):
             mapping[flight] = cat
     return mapping
@@ -120,14 +133,19 @@ def _build_flight_info_map(flights_out: pd.DataFrame) -> dict[str, tuple[object,
         return mapping
     if "FlightNumber" not in flights_out.columns:
         return mapping
+    category_col = "FinalCategory" if "FinalCategory" in flights_out.columns else "Category"
     for _, row in flights_out.iterrows():
         flight = str(row.get("FlightNumber", "")).strip()
         if not flight or flight.lower() == "nan" or flight in mapping:
             continue
-        mapping[flight] = (row.get("Category"), row.get("Positions"))
+        mapping[flight] = (row.get(category_col), row.get("Positions"))
     return mapping
 
-def _format_flight_with_info(flight: str, info_map: dict[str, tuple[object, object]]) -> str:
+def _format_flight_with_info(
+    flight: str,
+    info_map: dict[str, tuple[object, object]],
+    pos_override: object | None = None,
+) -> str:
     flight = str(flight or "").strip()
     if not flight:
         return ""
@@ -137,12 +155,118 @@ def _format_flight_with_info(flight: str, info_map: dict[str, tuple[object, obje
     if info is None:
         return flight
     cat_value, pos_value = info
+    if pos_override is not None:
+        pos_value = pos_override
     cat = _format_category_short(cat_value)
     pos = _format_positions_value(pos_value)
     return f"{flight} ( C= {cat} P={pos})"
 
-def _format_flight_cell(flights: list[str], info_map: dict[str, tuple[object, object]]) -> str:
-    return ", ".join(_format_flight_with_info(flight, info_map) for flight in flights)
+def _format_flight_cell(
+    flights: list[str],
+    info_map: dict[str, tuple[object, object]],
+    pos_map: dict[tuple[str, str], int] | None = None,
+    column: str | None = None,
+) -> str:
+    base = _extract_carousel_from_column(column) if column else None
+    parts: list[str] = []
+    for flight in flights:
+        pos_override = None
+        if pos_map is not None and base:
+            pos_override = pos_map.get((str(flight).strip(), base))
+        parts.append(_format_flight_with_info(flight, info_map, pos_override))
+    return ", ".join(parts)
+
+def _normalize_segments(value: object) -> list[dict[str, object]]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [seg for seg in value if isinstance(seg, dict)]
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in ("nan", "none"):
+            return []
+        try:
+            parsed = ast.literal_eval(text)
+        except Exception:
+            return []
+        return _normalize_segments(parsed)
+    return []
+
+def _build_flight_segment_positions_map(
+    flights_out: pd.DataFrame | None,
+) -> dict[tuple[str, str], int]:
+    mapping: dict[tuple[str, str], int] = {}
+    if flights_out is None or "FlightNumber" not in flights_out.columns:
+        return mapping
+    if "AssignmentSegments" not in flights_out.columns:
+        return mapping
+    for _, row in flights_out.iterrows():
+        flight = str(row.get("FlightNumber", "")).strip()
+        if not flight or flight.lower() == "nan":
+            continue
+        segments = _normalize_segments(row.get("AssignmentSegments"))
+        for seg in segments:
+            carousel = str(seg.get("carousel", "")).strip()
+            if not carousel:
+                continue
+            try:
+                wide_used = int(seg.get("wide_used", 0))
+            except Exception:
+                wide_used = 0
+            try:
+                narrow_used = int(seg.get("narrow_used", 0))
+            except Exception:
+                narrow_used = 0
+            positions = wide_used + narrow_used
+            key = (flight, carousel)
+            current = mapping.get(key, 0)
+            if positions > current:
+                mapping[key] = positions
+    return mapping
+
+def _build_flight_status_map(flights_out: pd.DataFrame | None) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    if flights_out is None or "FlightNumber" not in flights_out.columns:
+        return mapping
+    for _, row in flights_out.iterrows():
+        flight = str(row.get("FlightNumber", "")).strip()
+        if not flight or flight.lower() == "nan" or flight in mapping:
+            continue
+        changed = str(row.get("CategoryChanged", "")).strip().upper() == "YES"
+        split_count = 0
+        split_val = row.get("SplitCount", 0)
+        try:
+            if pd.isna(split_val):
+                split_val = 0
+        except Exception:
+            pass
+        try:
+            split_count = int(split_val)
+        except Exception:
+            split_count = 0
+        if split_count <= 1:
+            assigned = row.get("AssignedCarousels", "") or row.get("AssignedCarousel", "")
+            if isinstance(assigned, str) and "+" in assigned:
+                split_count = 2
+
+        if changed:
+            mapping[flight] = "narrow_wide"
+            continue
+        if split_count > 1:
+            mapping[flight] = "split"
+            continue
+
+        cat_value = row.get("FinalCategory", row.get("Category", ""))
+        cat = str(cat_value or "").strip().lower()
+        if cat in ("wide", "w"):
+            mapping[flight] = "wide"
+        elif cat in ("narrow", "n"):
+            mapping[flight] = "narrow"
+        else:
+            mapping[flight] = "other"
+    return mapping
 
 def _build_flight_terminal_map(flights_out: pd.DataFrame) -> dict[str, str]:
     mapping: dict[str, str] = {}
@@ -220,6 +344,8 @@ def write_timeline_excel(
     color_mode: str = "category",
     wide_color: str = "#D32F2F",
     narrow_color: str = "#FFEBEE",
+    split_color: str = "#FFC107",
+    narrow_wide_color: str = "#00B894",
     extra_columns: list[str] | None = None,
     extra_header_color: str = "#E6DFF7",
     extra_border_color: str = "#8064A2",
@@ -228,6 +354,8 @@ def write_timeline_excel(
 ):
     wide_color = _normalize_hex_color(wide_color, "#D32F2F")
     narrow_color = _normalize_hex_color(narrow_color, "#FFEBEE")
+    split_color = _normalize_hex_color(split_color, "#FFC107")
+    narrow_wide_color = _normalize_hex_color(narrow_wide_color, "#00B894")
     color_mode = str(color_mode or "category").strip().lower()
     if color_mode not in ("category", "flight", "terminal"):
         color_mode = "category"
@@ -237,6 +365,8 @@ def write_timeline_excel(
     extra_header_color = _normalize_hex_color(extra_header_color, "#E6DFF7")
     extra_border_color = _normalize_hex_color(extra_border_color, "#8064A2")
     flight_info = _build_flight_info_map(flights_out)
+    segment_positions = _build_flight_segment_positions_map(flights_out)
+    status_map = _build_flight_status_map(flights_out)
 
     with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
         out = timeline_df.copy()
@@ -304,10 +434,18 @@ def write_timeline_excel(
                 })
             return legend_cache[color]
 
+        row_ptr = 1
         if color_mode == "category":
-            worksheet.write(1, 1, "Wide", _legend(wide_color))
-            worksheet.write(2, 1, "Narrow", _legend(narrow_color))
-        elif color_mode == "flight":
+            worksheet.write(row_ptr, 1, "Wide", _legend(wide_color))
+            row_ptr += 1
+            worksheet.write(row_ptr, 1, "Narrow", _legend(narrow_color))
+            row_ptr += 1
+        worksheet.write(row_ptr, 1, "Split", _legend(split_color))
+        row_ptr += 1
+        worksheet.write(row_ptr, 1, "Narrow to Wide", _legend(narrow_wide_color))
+        row_ptr += 1
+
+        if color_mode == "flight":
             palette = [
                 "#F8CBAD",
                 "#C6E0B4",
@@ -323,7 +461,6 @@ def write_timeline_excel(
                 "#FCE4D6",
             ]
             flight_color = _build_flight_color_map(flights_out, timeline_df, palette)
-            row_ptr = 1
             for flight in sorted(flight_color.keys()):
                 worksheet.write(row_ptr, 1, flight, _legend(flight_color[flight]))
                 row_ptr += 1
@@ -343,13 +480,22 @@ def write_timeline_excel(
                 "#FCE4D6",
             ]
             terminal_color = _build_terminal_color_map(flights_out, timeline_df, palette)
-            row_ptr = 1
             for term in sorted(terminal_color.keys()):
                 worksheet.write(row_ptr, 1, term, _legend(terminal_color[term]))
                 row_ptr += 1
 
         if timeline_df.empty or len(timeline_df.columns) == 0:
             return
+
+        def _rule_color(flights: list[str]) -> str | None:
+            if not status_map:
+                return None
+            statuses = [status_map.get(f) for f in flights]
+            if "narrow_wide" in statuses:
+                return narrow_wide_color
+            if "split" in statuses:
+                return split_color
+            return None
 
         if color_mode == "category":
             cat_map = _build_flight_category_map(flights_out)
@@ -360,7 +506,12 @@ def write_timeline_excel(
                     flights = _extract_flights(cell_value)
                     if not flights:
                         continue
-                    display_value = _format_flight_cell(flights, flight_info)
+                    display_value = _format_flight_cell(
+                        flights,
+                        flight_info,
+                        segment_positions,
+                        timeline_df.columns[col_idx],
+                    )
                     has_wide = False
                     has_narrow = False
                     for flight in flights:
@@ -370,12 +521,15 @@ def write_timeline_excel(
                             break
                         if cat == "narrow":
                             has_narrow = True
+                    base_color = None
                     if has_wide:
-                        fmt = _fill(wide_color, is_extra)
+                        base_color = wide_color
                     elif has_narrow:
-                        fmt = _fill(narrow_color, is_extra)
-                    else:
-                        fmt = None
+                        base_color = narrow_color
+
+                    rule_color = _rule_color(flights)
+                    color = rule_color or base_color
+                    fmt = _fill(color, is_extra) if color else None
                     if fmt:
                         worksheet.write(row_idx + 1, col_idx + 2, display_value, fmt)
                     else:
@@ -404,7 +558,12 @@ def write_timeline_excel(
                     flights = _extract_flights(cell_value)
                     if not flights:
                         continue
-                    display_value = _format_flight_cell(flights, flight_info)
+                    display_value = _format_flight_cell(
+                        flights,
+                        flight_info,
+                        segment_positions,
+                        timeline_df.columns[col_idx],
+                    )
                     term = None
                     for flight in flights:
                         term = flight_terminal.get(flight)
@@ -412,7 +571,9 @@ def write_timeline_excel(
                             break
                     if not term:
                         term = _extract_terminal_from_column(timeline_df.columns[col_idx])
-                    color = terminal_color.get(term) if term else None
+                    base_color = terminal_color.get(term) if term else None
+                    rule_color = _rule_color(flights)
+                    color = rule_color or base_color
                     fmt = _fill(color, is_extra) if color else None
                     if fmt:
                         worksheet.write(row_idx + 1, col_idx + 2, display_value, fmt)
@@ -441,8 +602,15 @@ def write_timeline_excel(
                     flights = _extract_flights(cell_value)
                     if not flights:
                         continue
-                    display_value = _format_flight_cell(flights, flight_info)
-                    color = flight_color.get(flights[0])
+                    display_value = _format_flight_cell(
+                        flights,
+                        flight_info,
+                        segment_positions,
+                        timeline_df.columns[col_idx],
+                    )
+                    base_color = flight_color.get(flights[0])
+                    rule_color = _rule_color(flights)
+                    color = rule_color or base_color
                     fmt = _fill(color, is_extra) if color else None
                     if fmt:
                         worksheet.write(row_idx + 1, col_idx + 2, display_value, fmt)

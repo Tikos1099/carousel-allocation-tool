@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+import ast
 import pandas as pd
 
 @dataclass
@@ -73,9 +74,31 @@ def _build_timeline_from_assignments(
 
     cell_lists = {c: [[] for _ in range(len(timeline_index))] for c in carousels}
 
-    for _, row in flights_out.iterrows():
+    def _assigned_carousels_from_row(row) -> List[str]:
+        assigned_list = row.get("AssignedCarousels", None)
+        if assigned_list is not None:
+            if isinstance(assigned_list, (list, tuple, set)):
+                vals = [str(x).strip() for x in assigned_list if str(x).strip()]
+                return vals
+            s = str(assigned_list).strip()
+            if s and s.lower() != "nan" and s.upper() != "UNASSIGNED":
+                if "+" in s:
+                    return [p.strip() for p in s.split("+") if p.strip()]
+                if "," in s:
+                    return [p.strip() for p in s.split(",") if p.strip()]
+                return [s]
+
         assigned = row.get("AssignedCarousel")
-        if assigned not in cell_lists:
+        if assigned is None:
+            return []
+        s = str(assigned).strip()
+        if not s or s.lower() == "nan" or s.upper() == "UNASSIGNED":
+            return []
+        return [s]
+
+    for _, row in flights_out.iterrows():
+        assigned_list = _assigned_carousels_from_row(row)
+        if not assigned_list:
             continue
 
         open_t = pd.Timestamp(row.get(open_col))
@@ -102,8 +125,11 @@ def _build_timeline_from_assignments(
         if start_idx >= end_idx:
             continue
 
-        for i in range(start_idx, end_idx):
-            cell_lists[assigned][i].append(flight)
+        for assigned in assigned_list:
+            if assigned not in cell_lists:
+                continue
+            for i in range(start_idx, end_idx):
+                cell_lists[assigned][i].append(flight)
 
     for c in carousels:
         timeline_df[c] = [", ".join(items) if items else "" for items in cell_lists[c]]
@@ -323,3 +349,380 @@ def size_extra_makeups(
             return k, out, timeline_df, impossible
 
     return max_k, last_out, last_timeline, impossible
+
+def _normalize_category(value: object) -> str:
+    s = str(value or "").strip().lower()
+    if s in ("wide", "w"):
+        return "wide"
+    if s in ("narrow", "n"):
+        return "narrow"
+    return s
+
+def _max_multi_capacity(
+    carousel_caps: Dict[str, CarouselCapacity],
+    category: str,
+    max_carousels: int,
+) -> int:
+    if not carousel_caps or max_carousels <= 0:
+        return 0
+    category = _normalize_category(category)
+    caps: List[int] = []
+    for cap in carousel_caps.values():
+        if category == "wide":
+            caps.append(int(cap.wide) + int(cap.narrow))
+        else:
+            caps.append(int(cap.narrow))
+    caps.sort(reverse=True)
+    return sum(caps[: min(max_carousels, len(caps))])
+
+def _is_impossible_demand_multi(
+    category: str,
+    positions: int,
+    carousel_caps: Dict[str, CarouselCapacity],
+    max_carousels: int,
+) -> bool:
+    return positions > _max_multi_capacity(carousel_caps, category, max_carousels)
+
+def compute_single_assignment_segments(
+    flights: pd.DataFrame,
+    carousel_caps: Dict[str, CarouselCapacity],
+    *,
+    category_col="Category",
+    pos_col="Positions",
+    open_col="MakeupOpening",
+    close_col="MakeupClosing",
+    dep_col="DepartureTime",
+    assigned_col="AssignedCarousel",
+) -> pd.DataFrame:
+    if flights is None or len(flights) == 0:
+        out = flights.copy() if flights is not None else pd.DataFrame()
+        out["AssignmentSegments"] = [[] for _ in range(len(out))]
+        return out
+
+    carousels = list(carousel_caps.keys())
+    flights = flights.copy()
+    flights["_rowid"] = flights.index
+    flights["AssignmentSegments"] = [[] for _ in range(len(flights))]
+
+    active = {c: [] for c in carousels}
+    free = {
+        c: {"wide": int(carousel_caps[c].wide), "narrow": int(carousel_caps[c].narrow)}
+        for c in carousels
+    }
+
+    def release_until(t: pd.Timestamp):
+        for c in carousels:
+            still = []
+            for item in active[c]:
+                if item["close"] <= t:
+                    free[c]["wide"] += item["wide_used"]
+                    free[c]["narrow"] += item["narrow_used"]
+                else:
+                    still.append(item)
+            active[c] = still
+
+    ordered = flights.sort_values([open_col, dep_col]).reset_index(drop=True)
+    for _, row in ordered.iterrows():
+        assigned = row.get(assigned_col)
+        if assigned not in carousels:
+            continue
+        open_t = pd.Timestamp(row.get(open_col))
+        close_t = pd.Timestamp(row.get(close_col))
+        if pd.isna(open_t) or pd.isna(close_t):
+            continue
+        release_until(open_t)
+
+        cat = _normalize_category(row.get(category_col))
+        pos = int(row.get(pos_col, 0))
+        fw, fn = free[assigned]["wide"], free[assigned]["narrow"]
+        if not _can_fit(cat, pos, fw, fn):
+            continue
+        new_fw, new_fn = _consume(cat, pos, fw, fn)
+        wide_used = fw - new_fw
+        narrow_used = fn - new_fn
+        free[assigned]["wide"], free[assigned]["narrow"] = new_fw, new_fn
+        active[assigned].append({
+            "close": close_t,
+            "wide_used": wide_used,
+            "narrow_used": narrow_used,
+        })
+
+        rowid = row.get("_rowid")
+        flights.loc[flights["_rowid"] == rowid, "AssignmentSegments"] = [[{
+            "carousel": assigned,
+            "wide_used": wide_used,
+            "narrow_used": narrow_used,
+        }]]
+
+    flights = flights.drop(columns=["_rowid"])
+    return flights
+
+def _select_split_allocations(
+    category: str,
+    positions: int,
+    free: Dict[str, Dict[str, int]],
+    carousels: List[str],
+    rr_idx: int,
+    max_carousels: int,
+) -> Optional[List[Dict[str, object]]]:
+    if max_carousels <= 0 or not carousels:
+        return None
+    category = _normalize_category(category)
+    candidates: List[Tuple[str, int, int]] = []
+    for idx, c in enumerate(carousels):
+        fw, fn = free[c]["wide"], free[c]["narrow"]
+        cap = (fw + fn) if category == "wide" else fn
+        if cap > 0:
+            order = (idx - rr_idx) % len(carousels)
+            candidates.append((c, cap, order))
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: (-x[1], x[2], x[0]))
+    if sum(cap for _, cap, _ in candidates[:max_carousels]) < positions:
+        return None
+
+    allocations: List[Dict[str, object]] = []
+    remaining = positions
+    used = 0
+    for c, cap, _ in candidates:
+        if used >= max_carousels or remaining <= 0:
+            break
+        take = min(remaining, cap)
+        fw, fn = free[c]["wide"], free[c]["narrow"]
+        new_fw, new_fn = _consume(category, take, fw, fn)
+        allocations.append({
+            "carousel": c,
+            "wide_used": fw - new_fw,
+            "narrow_used": fn - new_fn,
+        })
+        remaining -= take
+        used += 1
+    if remaining > 0:
+        return None
+    return allocations
+
+def allocate_with_fixed_assignments(
+    fixed_flights: pd.DataFrame,
+    flex_flights: pd.DataFrame,
+    carousel_caps: Dict[str, CarouselCapacity],
+    *,
+    category_col="Category",
+    pos_col="Positions",
+    open_col="MakeupOpening",
+    close_col="MakeupClosing",
+    dep_col="DepartureTime",
+    flight_col="FlightNumber",
+    max_carousels_per_flight_narrow: int = 1,
+    max_carousels_per_flight_wide: int = 1,
+    allow_narrow_use_wide: bool = False,
+) -> pd.DataFrame:
+    def _normalize_segments(value: object) -> List[Dict[str, object]]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [seg for seg in value if isinstance(seg, dict)]
+        if isinstance(value, dict):
+            return [value]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text or text.lower() in ("nan", "none"):
+                return []
+            try:
+                parsed = ast.literal_eval(text)
+            except Exception:
+                return []
+            return _normalize_segments(parsed)
+        return []
+
+    if flex_flights is None or len(flex_flights) == 0:
+        out = flex_flights.copy() if flex_flights is not None else pd.DataFrame()
+        out["AssignedCarousels"] = [[] for _ in range(len(out))]
+        out["AssignmentSegments"] = [[] for _ in range(len(out))]
+        out["UnassignedReason"] = out.get("UnassignedReason", "")
+        out["AllocationCategory"] = ""
+        return out
+
+    carousels = list(carousel_caps.keys())
+    max_carousels_per_flight_narrow = max(1, int(max_carousels_per_flight_narrow))
+    max_carousels_per_flight_wide = max(1, int(max_carousels_per_flight_wide))
+
+    flex = flex_flights.copy()
+    flex["_rowid"] = flex.index
+    flex["AssignedCarousels"] = [[] for _ in range(len(flex))]
+    flex["AssignmentSegments"] = [[] for _ in range(len(flex))]
+    flex["UnassignedReason"] = ""
+    flex["AllocationCategory"] = ""
+
+    if not carousels:
+        flex["UnassignedReason"] = "NO_CAPACITY"
+        return flex.drop(columns=["_rowid"])
+
+    fixed = fixed_flights.copy() if fixed_flights is not None else pd.DataFrame()
+    fixed["AssignmentSegments"] = fixed.get("AssignmentSegments", [[] for _ in range(len(fixed))])
+
+    events = pd.concat(
+        [
+            fixed.assign(_fixed=1),
+            flex.assign(_fixed=0),
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+    events["_open"] = pd.to_datetime(events[open_col])
+    events["_close"] = pd.to_datetime(events[close_col])
+    events = events.sort_values(
+        by=["_open", "_fixed", dep_col],
+        ascending=[True, False, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+    active = {c: [] for c in carousels}
+    free = {
+        c: {"wide": int(carousel_caps[c].wide), "narrow": int(carousel_caps[c].narrow)}
+        for c in carousels
+    }
+    rr_idx = 0
+
+    def release_until(t: pd.Timestamp):
+        for c in carousels:
+            still = []
+            for item in active[c]:
+                if item["close"] <= t:
+                    free[c]["wide"] += item["wide_used"]
+                    free[c]["narrow"] += item["narrow_used"]
+                else:
+                    still.append(item)
+            active[c] = still
+
+    results: Dict[int, Dict[str, object]] = {}
+
+    for _, row in events.iterrows():
+        open_t = row.get("_open")
+        close_t = row.get("_close")
+        if pd.isna(open_t) or pd.isna(close_t):
+            continue
+        release_until(pd.Timestamp(open_t))
+
+        if int(row.get("_fixed", 0)) == 1:
+            segments = _normalize_segments(row.get("AssignmentSegments"))
+            for seg in segments:
+                c = seg.get("carousel")
+                if c not in free:
+                    continue
+                wide_used = int(seg.get("wide_used", 0))
+                narrow_used = int(seg.get("narrow_used", 0))
+                free[c]["wide"] -= wide_used
+                free[c]["narrow"] -= narrow_used
+                active[c].append({
+                    "close": pd.Timestamp(close_t),
+                    "wide_used": wide_used,
+                    "narrow_used": narrow_used,
+                })
+            continue
+
+        rowid = row.get("_rowid")
+        cat = _normalize_category(row.get(category_col))
+        pos = int(row.get(pos_col, 0))
+        alloc_cat = "wide" if allow_narrow_use_wide and cat == "narrow" else cat
+        max_car = max_carousels_per_flight_wide if alloc_cat == "wide" else max_carousels_per_flight_narrow
+
+        assigned_list: List[str] = []
+        segments: List[Dict[str, object]] = []
+        reason = ""
+
+        if _is_impossible_demand_multi(alloc_cat, pos, carousel_caps, max_car):
+            reason = "IMPOSSIBLE_DEMAND"
+        else:
+            tried = 0
+            while tried < len(carousels):
+                c = carousels[(rr_idx + tried) % len(carousels)]
+                fw, fn = free[c]["wide"], free[c]["narrow"]
+                if _can_fit(alloc_cat, pos, fw, fn):
+                    new_fw, new_fn = _consume(alloc_cat, pos, fw, fn)
+                    wide_used = fw - new_fw
+                    narrow_used = fn - new_fn
+                    free[c]["wide"], free[c]["narrow"] = new_fw, new_fn
+                    active[c].append({
+                        "close": pd.Timestamp(close_t),
+                        "wide_used": wide_used,
+                        "narrow_used": narrow_used,
+                    })
+                    assigned_list = [c]
+                    segments = [{
+                        "carousel": c,
+                        "wide_used": wide_used,
+                        "narrow_used": narrow_used,
+                    }]
+                    rr_idx = (rr_idx + tried + 1) % len(carousels)
+                    break
+                tried += 1
+
+            if not assigned_list and max_car > 1:
+                allocations = _select_split_allocations(alloc_cat, pos, free, carousels, rr_idx, max_car)
+                if allocations:
+                    for alloc in allocations:
+                        c = alloc["carousel"]
+                        free[c]["wide"] -= int(alloc["wide_used"])
+                        free[c]["narrow"] -= int(alloc["narrow_used"])
+                        active[c].append({
+                            "close": pd.Timestamp(close_t),
+                            "wide_used": int(alloc["wide_used"]),
+                            "narrow_used": int(alloc["narrow_used"]),
+                        })
+                        assigned_list.append(c)
+                        segments.append({
+                            "carousel": c,
+                            "wide_used": int(alloc["wide_used"]),
+                            "narrow_used": int(alloc["narrow_used"]),
+                        })
+                    first_idx = carousels.index(assigned_list[0])
+                    rr_idx = (first_idx + 1) % len(carousels)
+
+            if not assigned_list and not reason:
+                reason = "NO_CAPACITY"
+
+        results[rowid] = {
+            "AssignedCarousels": assigned_list,
+            "AssignmentSegments": segments,
+            "UnassignedReason": reason,
+            "AllocationCategory": alloc_cat,
+        }
+
+    for rowid, info in results.items():
+        idxs = flex.index[flex["_rowid"] == rowid]
+        if len(idxs) == 0:
+            continue
+        for idx in idxs:
+            flex.at[idx, "AssignedCarousels"] = info["AssignedCarousels"]
+            flex.at[idx, "AssignmentSegments"] = info["AssignmentSegments"]
+            flex.at[idx, "UnassignedReason"] = info["UnassignedReason"]
+            flex.at[idx, "AllocationCategory"] = info["AllocationCategory"]
+
+    missing_reason = (flex["AssignedCarousels"].apply(len) == 0) & (flex["UnassignedReason"] == "")
+    flex.loc[missing_reason, "UnassignedReason"] = "NO_CAPACITY"
+
+    flex = flex.drop(columns=["_rowid"])
+    return flex
+
+def build_timeline_from_assignments(
+    flights_out: pd.DataFrame,
+    carousels: List[str],
+    time_step_minutes: int,
+    start_time: pd.Timestamp,
+    end_time: pd.Timestamp,
+    *,
+    open_col="MakeupOpening",
+    close_col="MakeupClosing",
+    flight_col="FlightNumber",
+) -> pd.DataFrame:
+    return _build_timeline_from_assignments(
+        flights_out=flights_out,
+        carousels=carousels,
+        time_step_minutes=time_step_minutes,
+        start_time=start_time,
+        end_time=end_time,
+        open_col=open_col,
+        close_col=close_col,
+        flight_col=flight_col,
+    )

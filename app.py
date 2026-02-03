@@ -5,7 +5,13 @@ import re
 import unicodedata
 from pathlib import Path
 
-from allocator import CarouselCapacity, allocate_round_robin, size_extra_makeups
+from allocator import (
+    CarouselCapacity,
+    allocate_round_robin,
+    allocate_with_fixed_assignments,
+    build_timeline_from_assignments,
+    compute_single_assignment_segments,
+)
 from io_excel import write_summary_txt, write_summary_csv, write_timeline_excel
 
 BRAND_RED = "#D32F2F"
@@ -304,6 +310,186 @@ def _build_extra_terms_and_defaults(
     return terminals, defaults
 
 
+def _readjust_terminal_allocations(
+    flights_out_term: pd.DataFrame,
+    carousel_caps: dict[str, CarouselCapacity],
+    *,
+    extra_capacity: CarouselCapacity | None,
+    time_step_minutes: int,
+    start_time: pd.Timestamp,
+    end_time: pd.Timestamp,
+    max_carousels_narrow: int,
+    max_carousels_wide: int,
+    rule_order: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], pd.DataFrame]:
+    if flights_out_term is None or len(flights_out_term) == 0:
+        empty = flights_out_term.copy() if flights_out_term is not None else pd.DataFrame()
+        timeline = build_timeline_from_assignments(
+            empty,
+            list(carousel_caps.keys()),
+            time_step_minutes,
+            start_time,
+            end_time,
+        )
+        return empty, timeline, [], empty.iloc[0:0].copy()
+
+    readjusted = flights_out_term.copy()
+    readjusted["OriginalCategory"] = readjusted["Category"].astype(str).str.strip()
+    readjusted["FinalCategory"] = readjusted["OriginalCategory"]
+    readjusted["CategoryChanged"] = "NO"
+    readjusted["AssignedCarousels"] = [[] for _ in range(len(readjusted))]
+    readjusted["AssignmentSegments"] = [[] for _ in range(len(readjusted))]
+    readjusted["SplitCount"] = 0
+
+    assigned_vals = readjusted["AssignedCarousel"].fillna("").astype(str).str.strip()
+    assigned_mask = (
+        assigned_vals.ne("")
+        & assigned_vals.str.upper().ne("UNASSIGNED")
+        & assigned_vals.str.lower().ne("nan")
+    )
+    readjusted.loc[assigned_mask, "AssignedCarousels"] = assigned_vals[assigned_mask].apply(lambda x: [x])
+    readjusted.loc[assigned_mask, "SplitCount"] = 1
+
+    fixed = readjusted[assigned_mask].copy()
+    if len(fixed) > 0:
+        fixed = compute_single_assignment_segments(
+            fixed,
+            carousel_caps,
+        )
+        readjusted.loc[fixed.index, "AssignmentSegments"] = fixed["AssignmentSegments"]
+
+    def _candidate_mask(df: pd.DataFrame) -> pd.Series:
+        reasons = df["UnassignedReason"].fillna("").astype(str).str.upper()
+        return (df["AssignedCarousels"].apply(len) == 0) & reasons.isin(["NO_CAPACITY", "IMPOSSIBLE_DEMAND"])
+
+    def _apply_updates(updates: pd.DataFrame):
+        if updates is None or len(updates) == 0:
+            return
+        for idx, row in updates.iterrows():
+            assigned_list = row.get("AssignedCarousels", [])
+            readjusted.at[idx, "AssignedCarousels"] = assigned_list
+            readjusted.at[idx, "AssignmentSegments"] = row.get("AssignmentSegments", [])
+            readjusted.at[idx, "UnassignedReason"] = row.get("UnassignedReason", "")
+            readjusted.at[idx, "SplitCount"] = len(assigned_list) if assigned_list else 0
+
+            alloc_cat = str(row.get("AllocationCategory", "")).strip().lower()
+            orig_cat = str(readjusted.at[idx, "OriginalCategory"]).strip().lower()
+            if assigned_list and alloc_cat == "wide" and orig_cat == "narrow":
+                readjusted.at[idx, "FinalCategory"] = "Wide"
+                readjusted.at[idx, "CategoryChanged"] = "YES"
+
+    extras_used: list[str] = []
+    current_caps = dict(carousel_caps)
+    allow_multi = False
+    allow_narrow_wide = False
+
+    def _current_max() -> tuple[int, int]:
+        if allow_multi:
+            return int(max_carousels_narrow), int(max_carousels_wide)
+        return 1, 1
+
+    def _allocate_step():
+        flex = readjusted[_candidate_mask(readjusted)].copy()
+        if len(flex) == 0:
+            return
+        fixed = readjusted[readjusted["AssignedCarousels"].apply(len) > 0].copy()
+        max_n, max_w = _current_max()
+        assigned = allocate_with_fixed_assignments(
+            fixed,
+            flex,
+            current_caps,
+            max_carousels_per_flight_narrow=max_n,
+            max_carousels_per_flight_wide=max_w,
+            allow_narrow_use_wide=allow_narrow_wide,
+        )
+        _apply_updates(assigned)
+
+    def _allocate_with_extras():
+        nonlocal current_caps, extras_used
+        if extra_capacity is None:
+            return
+        flex = readjusted[_candidate_mask(readjusted)].copy()
+        if len(flex) == 0:
+            return
+        fixed = readjusted[readjusted["AssignedCarousels"].apply(len) > 0].copy()
+        max_n, max_w = _current_max()
+
+        max_k = len(flex)
+        best = None
+        best_k = 0
+        best_caps = current_caps
+        for k in range(1, max_k + 1):
+            caps_extra = {
+                **current_caps,
+                **{f"EXTRA{i}": extra_capacity for i in range(1, k + 1)},
+            }
+            attempt = allocate_with_fixed_assignments(
+                fixed,
+                flex,
+                caps_extra,
+                max_carousels_per_flight_narrow=max_n,
+                max_carousels_per_flight_wide=max_w,
+                allow_narrow_use_wide=allow_narrow_wide,
+            )
+            blocked = attempt[
+                (attempt["AssignedCarousels"].apply(len) == 0)
+                & (attempt["UnassignedReason"] != "IMPOSSIBLE_DEMAND")
+            ]
+            best = attempt
+            best_k = k
+            best_caps = caps_extra
+            if len(blocked) == 0:
+                break
+
+        if best is not None:
+            extras_used = [f"EXTRA{i}" for i in range(1, best_k + 1)]
+            current_caps = best_caps
+            _apply_updates(best)
+
+    seen = set()
+    for rule in rule_order or []:
+        if rule in seen:
+            continue
+        seen.add(rule)
+        if rule == "multi":
+            allow_multi = True
+            _allocate_step()
+        elif rule == "narrow_wide":
+            allow_narrow_wide = True
+            _allocate_step()
+        elif rule == "extras":
+            _allocate_with_extras()
+
+    carousels_list = list(carousel_caps.keys()) + extras_used
+    timeline_term = build_timeline_from_assignments(
+        readjusted,
+        carousels_list,
+        time_step_minutes,
+        start_time,
+        end_time,
+    )
+
+    def _assigned_carousel_value(lst: list[str]) -> str:
+        if not lst:
+            return "UNASSIGNED"
+        if len(lst) == 1:
+            return lst[0]
+        return "SPLIT"
+
+    readjusted["SplitCount"] = readjusted["AssignedCarousels"].apply(len)
+    readjusted["AssignedCarousel"] = readjusted["AssignedCarousels"].apply(_assigned_carousel_value)
+    readjusted["Category"] = readjusted["FinalCategory"]
+    readjusted["AssignedCarousels"] = readjusted["AssignedCarousels"].apply(
+        lambda lst: "+".join(lst) if lst else "UNASSIGNED"
+    )
+    impossible_df = readjusted[
+        (readjusted["AssignedCarousels"] == "UNASSIGNED")
+        & (readjusted["UnassignedReason"] == "IMPOSSIBLE_DEMAND")
+    ].copy()
+
+    return readjusted, timeline_term, extras_used, impossible_df
+
+
 st.subheader("Etape 1 - Upload fichier vols")
 uploaded = st.file_uploader("Chargez le fichier Excel des vols", type=["xlsx"], key="flights_file")
 
@@ -369,19 +555,22 @@ with st.sidebar:
     )
     wide_color_default = "#D32F2F"
     narrow_color_default = "#FFEBEE"
-    if color_mode_ui == "Par categorie":
-        wide_color = st.color_picker("Couleur Wide", value=wide_color_default, key="wide_color")
-        narrow_color = st.color_picker("Couleur Narrow", value=narrow_color_default, key="narrow_color")
+    split_color_default = "#FFC107"
+    narrow_wide_color_default = "#00B894"
+    wide_color = st.session_state.get("wide_color", wide_color_default)
+    narrow_color = st.session_state.get("narrow_color", narrow_color_default)
+    split_color = st.session_state.get("split_color", split_color_default)
+    narrow_wide_color = st.session_state.get("narrow_wide_color", narrow_wide_color_default)
+    if color_mode_ui == "Par terminal":
+        st.caption("Mode par terminal: couleurs automatiques (hors exceptions).")
+    elif color_mode_ui == "Par vol":
+        st.caption("Mode par vol: couleurs automatiques (hors exceptions).")
     else:
-        wide_color = st.session_state.get("wide_color", wide_color_default)
-        narrow_color = st.session_state.get("narrow_color", narrow_color_default)
-        if color_mode_ui == "Par terminal":
-            st.caption("Mode par terminal: couleurs automatiques.")
-        else:
-            st.caption("Mode par vol: couleurs automatiques.")
+        st.caption("Couleurs Wide/Narrow definies dans l'etape 6b.")
 
     with st.expander("Options avancees", expanded=False):
         show_warnings = st.checkbox("Afficher panneau Warnings", value=True, key="show_warnings")
+        show_debug = st.checkbox("Afficher details erreur", value=False, key="show_debug_errors")
 
 
 if df_raw is None:
@@ -776,6 +965,124 @@ caps_by_terminal = st.session_state.get("caps_by_terminal")
 caps_manual = st.session_state.get("caps_manual")
 carousels_mode = st.session_state.get("carousels_mode")
 
+st.markdown("### Readjustement")
+apply_readjustment = st.checkbox(
+    "Appliquer les regles de readjustement",
+    value=True,
+    key="apply_readjustment",
+)
+
+rule_multi = False
+rule_narrow_wide = False
+rule_extras = False
+max_carousels_narrow = 1
+max_carousels_wide = 1
+rule_order = []
+
+if apply_readjustment:
+    rule_multi = st.checkbox("Regle 1 - Multi-carousels", value=True, key="rule_multi")
+    max_cols = st.columns(2)
+    with max_cols[0]:
+        max_carousels_narrow = st.number_input(
+            "MAX_CAROUSELS_PER_FLIGHT_NARROW",
+            min_value=1,
+            value=int(st.session_state.get("max_carousels_narrow", 3)),
+            step=1,
+            key="max_carousels_narrow",
+            disabled=not rule_multi,
+        )
+    with max_cols[1]:
+        max_carousels_wide = st.number_input(
+            "MAX_CAROUSELS_PER_FLIGHT_WIDE",
+            min_value=1,
+            value=int(st.session_state.get("max_carousels_wide", 2)),
+            step=1,
+            key="max_carousels_wide",
+            disabled=not rule_multi,
+        )
+
+    rule_narrow_wide = st.checkbox("Regle 2 - Narrow -> Wide", value=False, key="rule_narrow_wide")
+    rule_extras = st.checkbox("Regle 3 - Extras", value=True, key="rule_extras")
+
+    enabled_rules = []
+    if rule_multi:
+        enabled_rules.append("multi")
+    if rule_narrow_wide:
+        enabled_rules.append("narrow_wide")
+    if rule_extras:
+        enabled_rules.append("extras")
+
+    if enabled_rules:
+        label_map = {
+            "multi": "Regle 1 - Multi-carousels",
+            "narrow_wide": "Regle 2 - Narrow -> Wide",
+            "extras": "Regle 3 - Extras",
+        }
+        id_by_label = {v: k for k, v in label_map.items()}
+        default_order = [r for r in st.session_state.get("rule_order", []) if r in enabled_rules]
+        for r in ["multi", "narrow_wide", "extras"]:
+            if r in enabled_rules and r not in default_order:
+                default_order.append(r)
+
+        st.markdown("**Ordre de priorite**")
+        remaining = enabled_rules.copy()
+        order = []
+
+        opt1 = [label_map[r] for r in remaining]
+        default1 = label_map[default_order[0]] if default_order else opt1[0]
+        sel1 = st.selectbox("Priorite 1", options=opt1, index=opt1.index(default1), key="rule_order_1")
+        sel1_id = id_by_label[sel1]
+        order.append(sel1_id)
+        remaining.remove(sel1_id)
+
+        if remaining:
+            opt2 = [label_map[r] for r in remaining]
+            default2 = label_map[default_order[1]] if len(default_order) > 1 and default_order[1] in remaining else opt2[0]
+            sel2 = st.selectbox("Priorite 2", options=opt2, index=opt2.index(default2), key="rule_order_2")
+            sel2_id = id_by_label[sel2]
+            order.append(sel2_id)
+            remaining.remove(sel2_id)
+
+        if remaining:
+            opt3 = [label_map[r] for r in remaining]
+            default3 = label_map[default_order[2]] if len(default_order) > 2 and default_order[2] in remaining else opt3[0]
+            sel3 = st.selectbox("Priorite 3", options=opt3, index=opt3.index(default3), key="rule_order_3")
+            sel3_id = id_by_label[sel3]
+            order.append(sel3_id)
+            remaining.remove(sel3_id)
+
+        rule_order = order
+
+st.markdown("**Couleurs planning (regles / exceptions)**")
+color_cols = st.columns(4)
+with color_cols[0]:
+    st.color_picker(
+        "Couleur Wide",
+        value=st.session_state.get("wide_color", "#D32F2F"),
+        key="wide_color",
+    )
+with color_cols[1]:
+    st.color_picker(
+        "Couleur Narrow",
+        value=st.session_state.get("narrow_color", "#FFEBEE"),
+        key="narrow_color",
+    )
+with color_cols[2]:
+    st.color_picker(
+        "Couleur Split",
+        value=st.session_state.get("split_color", "#FFC107"),
+        key="split_color",
+    )
+with color_cols[3]:
+    st.color_picker(
+        "Couleur Narrow -> Wide",
+        value=st.session_state.get("narrow_wide_color", "#00B894"),
+        key="narrow_wide_color",
+    )
+st.caption("Les couleurs Split / Narrow->Wide ont priorite sur les autres modes.")
+
+st.session_state["rule_order"] = rule_order
+
 extra_terminals, extra_defaults = _build_extra_terms_and_defaults(
     df_ready,
     carousels_mode,
@@ -784,6 +1091,7 @@ extra_terminals, extra_defaults = _build_extra_terms_and_defaults(
 )
 
 extra_caps_by_terminal = {}
+extras_enabled = bool(apply_readjustment and rule_extras)
 if not extra_terminals:
     st.info("Aucun terminal configure pour dimensionnement extra.")
 elif extra_terminals == ["ALL"]:
@@ -794,6 +1102,7 @@ elif extra_terminals == ["ALL"]:
         value=int(wide_def),
         step=1,
         key="extra_wide_ALL",
+        disabled=not extras_enabled,
     )
     nar_val = st.number_input(
         "Extra Narrow capacity",
@@ -801,6 +1110,7 @@ elif extra_terminals == ["ALL"]:
         value=int(nar_def),
         step=1,
         key="extra_narrow_ALL",
+        disabled=not extras_enabled,
     )
     extra_caps_by_terminal["ALL"] = CarouselCapacity(int(wide_val), int(nar_val))
 else:
@@ -815,6 +1125,7 @@ else:
                 value=int(wide_def),
                 step=1,
                 key=f"extra_wide_{term}",
+                disabled=not extras_enabled,
             )
         with cols[1]:
             nar_val = st.number_input(
@@ -823,6 +1134,7 @@ else:
                 value=int(nar_def),
                 step=1,
                 key=f"extra_narrow_{term}",
+                disabled=not extras_enabled,
             )
         extra_caps_by_terminal[term] = CarouselCapacity(int(wide_val), int(nar_val))
 
@@ -911,36 +1223,63 @@ if st.button("Run allocation", key="run_allocation"):
                 end_time=pd.Timestamp(end_time),
             )
 
-        unassigned_df = flights_out[flights_out["AssignedCarousel"] == "UNASSIGNED"].copy()
-        warnings_rows.append({
-            "Type": "UNASSIGNED",
-            "Message": "Vols non assignes",
-            "Count": int(len(unassigned_df)),
-        })
+        apply_readjustment = bool(st.session_state.get("apply_readjustment", True))
+        max_carousels_narrow = int(st.session_state.get("max_carousels_narrow", 3))
+        max_carousels_wide = int(st.session_state.get("max_carousels_wide", 2))
+        rule_multi = bool(st.session_state.get("rule_multi", False))
+        rule_narrow_wide = bool(st.session_state.get("rule_narrow_wide", False))
+        rule_extras = bool(st.session_state.get("rule_extras", False))
+        rule_order = st.session_state.get("rule_order", [])
 
-        timeline_readjusted = timeline_df.copy()
+        enabled_rules = []
+        if apply_readjustment:
+            if rule_multi:
+                enabled_rules.append("multi")
+            if rule_narrow_wide:
+                enabled_rules.append("narrow_wide")
+            if rule_extras:
+                enabled_rules.append("extras")
+            rule_order = [r for r in rule_order if r in enabled_rules]
+            for r in ["multi", "narrow_wide", "extras"]:
+                if r in enabled_rules and r not in rule_order:
+                    rule_order.append(r)
+        else:
+            rule_order = []
+
+        flights_readjusted_list = []
+        timelines_readjusted = []
         extra_columns = []
         extra_summary_rows = []
         extra_warnings = []
-
-        unassigned_no_capacity = unassigned_df[unassigned_df["UnassignedReason"] == "NO_CAPACITY"].copy()
         processed_terms = set()
 
-        if len(unassigned_no_capacity) > 0 and extra_caps_by_terminal:
-            if "Terminal" in unassigned_no_capacity.columns:
-                grouped_terms = unassigned_no_capacity.groupby("Terminal")
-            else:
-                grouped_terms = [("ALL", unassigned_no_capacity)]
-
-            for term, df_term in grouped_terms:
+        if not apply_readjustment or not rule_order:
+            flights_readjusted = flights_out.copy()
+            flights_readjusted["OriginalCategory"] = flights_readjusted["Category"].astype(str).str.strip()
+            flights_readjusted["FinalCategory"] = flights_readjusted["OriginalCategory"]
+            flights_readjusted["CategoryChanged"] = "NO"
+            flights_readjusted["Category"] = flights_readjusted["FinalCategory"]
+            flights_readjusted["AssignedCarousels"] = (
+                flights_readjusted["AssignedCarousel"].fillna("UNASSIGNED").astype(str)
+            )
+            flights_readjusted["SplitCount"] = flights_readjusted["AssignedCarousels"].apply(
+                lambda v: 0 if str(v).upper() == "UNASSIGNED" else 1
+            )
+            timeline_readjusted = timeline_df.copy()
+        elif carousels_mode == "file":
+            for term, df_term in flights_out.groupby("Terminal"):
                 processed_terms.add(term)
-                cap = extra_caps_by_terminal.get(term)
-                if cap is None:
-                    extra_warnings.append({
-                        "Type": "Extra sizing",
-                        "Message": f"Terminal sans capacite extra configuree: {term}",
-                        "Count": int(len(df_term)),
-                    })
+                caps_term = caps_by_terminal.get(term)
+                if caps_term is None:
+                    tmp = df_term.copy()
+                    tmp["OriginalCategory"] = tmp["Category"].astype(str).str.strip()
+                    tmp["FinalCategory"] = tmp["OriginalCategory"]
+                    tmp["CategoryChanged"] = "NO"
+                    tmp["Category"] = tmp["FinalCategory"]
+                    tmp["AssignedCarousels"] = "UNASSIGNED"
+                    tmp["SplitCount"] = 0
+                    tmp["AssignedCarousel"] = "UNASSIGNED"
+                    flights_readjusted_list.append(tmp)
                     extra_summary_rows.append({
                         "Terminal": term,
                         "Nb extra makeups": 0,
@@ -948,42 +1287,101 @@ if st.button("Run allocation", key="run_allocation"):
                     })
                     continue
 
-                k, extra_assigned, extra_timeline, extra_impossible = size_extra_makeups(
-                    flights=df_term,
-                    extra_capacity=cap,
+                extra_cap = None
+                if rule_extras and extra_caps_by_terminal:
+                    extra_cap = extra_caps_by_terminal.get(term)
+                readj_term, timeline_term, extras_used, impossible_df = _readjust_terminal_allocations(
+                    df_term,
+                    caps_term,
+                    extra_capacity=extra_cap,
                     time_step_minutes=int(current_time_step),
                     start_time=pd.Timestamp(start_time),
                     end_time=pd.Timestamp(end_time),
+                    max_carousels_narrow=max_carousels_narrow,
+                    max_carousels_wide=max_carousels_wide,
+                    rule_order=rule_order,
                 )
 
-                if extra_impossible is not None and len(extra_impossible) > 0:
+                if timeline_term is not None and len(timeline_term.columns) > 0:
+                    timeline_term = timeline_term.reindex(timeline_df.index, fill_value="")
+                    timeline_term = timeline_term.rename(columns={
+                        c: f"{term}-{c}" for c in timeline_term.columns
+                    })
+                    timelines_readjusted.append(timeline_term)
+
+                flights_readjusted_list.append(readj_term)
+                cols = [f"{term}-{c}" for c in extras_used]
+                extra_columns.extend(cols)
+                extra_summary_rows.append({
+                    "Terminal": term,
+                    "Nb extra makeups": int(len(extras_used)),
+                    "Liste": ", ".join(cols),
+                })
+
+                if rule_extras and extra_cap is None:
+                    remaining = readj_term[readj_term["AssignedCarousel"] == "UNASSIGNED"]
+                    if len(remaining) > 0:
+                        extra_warnings.append({
+                            "Type": "Extra sizing",
+                            "Message": f"Terminal sans capacite extra configuree: {term}",
+                            "Count": int(len(remaining)),
+                        })
+
+                if rule_extras and impossible_df is not None and len(impossible_df) > 0:
                     extra_warnings.append({
                         "Type": "Extra sizing",
                         "Message": f"Vols impossibles pour extra ({term})",
-                        "Count": int(len(extra_impossible)),
+                        "Count": int(len(impossible_df)),
                     })
 
-                cols = [
-                    f"{term}-EXTRA{i}" if term != "ALL" else f"ALL-EXTRA{i}"
-                    for i in range(1, k + 1)
-                ]
-                if k > 0:
-                    extra_timeline = extra_timeline.reindex(timeline_df.index, fill_value="")
-                    extra_timeline = extra_timeline.reindex(
-                        columns=[f"EXTRA{i}" for i in range(1, k + 1)],
-                        fill_value="",
-                    )
-                    extra_timeline = extra_timeline.rename(columns={
-                        f"EXTRA{i}": cols[i - 1] for i in range(1, k + 1)
-                    })
-                    timeline_readjusted = pd.concat([timeline_readjusted, extra_timeline], axis=1)
-                    extra_columns.extend(cols)
+            flights_readjusted = (
+                pd.concat(flights_readjusted_list, ignore_index=True)
+                if flights_readjusted_list
+                else flights_out.copy()
+            )
+            if timelines_readjusted:
+                timeline_readjusted = pd.concat(timelines_readjusted, axis=1).sort_index(axis=1)
+            else:
+                timeline_readjusted = pd.DataFrame(index=timeline_df.index)
+        else:
+            extra_cap = None
+            if rule_extras and extra_caps_by_terminal:
+                extra_cap = extra_caps_by_terminal.get("ALL")
+            flights_readjusted, timeline_readjusted, extras_used, impossible_df = _readjust_terminal_allocations(
+                flights_out,
+                caps_manual,
+                extra_capacity=extra_cap,
+                time_step_minutes=int(current_time_step),
+                start_time=pd.Timestamp(start_time),
+                end_time=pd.Timestamp(end_time),
+                max_carousels_narrow=max_carousels_narrow,
+                max_carousels_wide=max_carousels_wide,
+                rule_order=rule_order,
+            )
+            timeline_readjusted = timeline_readjusted.reindex(timeline_df.index, fill_value="")
+            extra_columns = extras_used
+            extra_summary_rows.append({
+                "Terminal": "ALL",
+                "Nb extra makeups": int(len(extras_used)),
+                "Liste": ", ".join(extras_used),
+            })
 
-                extra_summary_rows.append({
-                    "Terminal": term,
-                    "Nb extra makeups": int(k),
-                    "Liste": ", ".join(cols),
+            if rule_extras and extra_cap is None:
+                remaining = flights_readjusted[flights_readjusted["AssignedCarousel"] == "UNASSIGNED"]
+                if len(remaining) > 0:
+                    extra_warnings.append({
+                        "Type": "Extra sizing",
+                        "Message": "Terminal sans capacite extra configuree: ALL",
+                        "Count": int(len(remaining)),
+                    })
+
+            if rule_extras and impossible_df is not None and len(impossible_df) > 0:
+                extra_warnings.append({
+                    "Type": "Extra sizing",
+                    "Message": "Vols impossibles pour extra (ALL)",
+                    "Count": int(len(impossible_df)),
                 })
+            processed_terms.add("ALL")
 
         if extra_caps_by_terminal:
             for term in extra_caps_by_terminal.keys():
@@ -1005,8 +1403,16 @@ if st.button("Run allocation", key="run_allocation"):
 
         warnings_rows.extend(extra_warnings)
 
+        unassigned_df = flights_readjusted[flights_readjusted["AssignedCarousel"] == "UNASSIGNED"].copy()
+        warnings_rows.append({
+            "Type": "UNASSIGNED",
+            "Message": "Vols non assignes",
+            "Count": int(len(unassigned_df)),
+        })
+
         st.session_state["results"] = {
             "flights_out": flights_out,
+            "flights_readjusted": flights_readjusted,
             "timeline_df": timeline_df,
             "timeline_readjusted": timeline_readjusted,
             "warnings_rows": warnings_rows,
@@ -1014,19 +1420,25 @@ if st.button("Run allocation", key="run_allocation"):
             "color_mode": color_mode,
             "wide_color": wide_color,
             "narrow_color": narrow_color,
+            "split_color": split_color,
+            "narrow_wide_color": narrow_wide_color,
             "extra_columns": extra_columns,
             "extra_summary_df": extra_summary_df,
             "extra_makeups_df": extra_makeups_df,
         }
         st.session_state["run_done"] = True
         st.rerun()
-    except Exception:
-        st.error("Erreur pendant l'allocation. Verifiez les donnees.")
+    except Exception as exc:
+        if st.session_state.get("show_debug_errors", False):
+            st.exception(exc)
+        else:
+            st.error("Erreur pendant l'allocation. Verifiez les donnees.")
 
 
 if st.session_state.get("run_done") and st.session_state.get("results"):
     results = st.session_state["results"]
     flights_out = results["flights_out"]
+    flights_readjusted = results.get("flights_readjusted", flights_out)
     timeline_df = results["timeline_df"]
     timeline_readjusted = results.get("timeline_readjusted", timeline_df)
     warnings_rows = results["warnings_rows"]
@@ -1034,8 +1446,26 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
     extra_columns = results.get("extra_columns", [])
     extra_summary_df = results.get("extra_summary_df")
     extra_makeups_df = results.get("extra_makeups_df")
+    split_color = results.get("split_color", "#FFC107")
+    narrow_wide_color = results.get("narrow_wide_color", "#00B894")
 
-    total = int(len(flights_out))
+    display_df = flights_readjusted.drop(columns=["AssignmentSegments"], errors="ignore").copy()
+    legend = pd.Series([""] * len(display_df), index=display_df.index, dtype="object")
+    changed_mask = display_df.get("CategoryChanged", pd.Series([""] * len(display_df))).astype(str).str.upper() == "YES"
+    legend[changed_mask] = "Narrow->Wide"
+    split_mask = pd.Series([False] * len(display_df), index=display_df.index)
+    if "SplitCount" in display_df.columns:
+        split_mask |= display_df["SplitCount"].fillna(0).astype(int) > 1
+    if "AssignedCarousels" in display_df.columns:
+        split_mask |= display_df["AssignedCarousels"].astype(str).str.contains(r"\+")
+    legend[(~changed_mask) & split_mask] = "Split"
+    cat_col = "FinalCategory" if "FinalCategory" in display_df.columns else "Category"
+    cat_series = display_df.get(cat_col, pd.Series([""] * len(display_df))).astype(str).str.strip().str.lower()
+    cat_label = cat_series.map({"wide": "Wide", "w": "Wide", "narrow": "Narrow", "n": "Narrow"}).fillna("Other")
+    legend_mask = legend == ""
+    legend[legend_mask] = cat_label[legend_mask]
+    display_df["LegendCategory"] = legend
+    total = int(len(display_df))
     unassigned_count = int(len(unassigned_df))
     assigned_pct = 0 if total == 0 else int(round(100 * (total - unassigned_count) / total))
 
@@ -1044,20 +1474,34 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
     kpi_cols[1].metric("% assignes", f"{assigned_pct}%")
     kpi_cols[2].metric("Nb UNASSIGNED", unassigned_count)
 
+    split_count = int((display_df.get("SplitCount", 0).fillna(0).astype(int) > 1).sum()) if total else 0
+    split_pct = 0 if total == 0 else int(round(100 * split_count / total))
+    changed_mask = display_df.get("CategoryChanged", pd.Series([""] * total)).astype(str).str.upper() == "YES"
+    narrow_wide_count = int(changed_mask.sum()) if total else 0
+    narrow_wide_pct = 0 if total == 0 else int(round(100 * narrow_wide_count / total))
+    kpi_cols2 = st.columns(4)
+    kpi_cols2[0].metric("Nb vols split", split_count)
+    kpi_cols2[1].metric("% split", f"{split_pct}%")
+    kpi_cols2[2].metric("Nb Narrow->Wide", narrow_wide_count)
+    kpi_cols2[3].metric("% Narrow->Wide", f"{narrow_wide_pct}%")
+
     with st.expander("Filtres resultats", expanded=True):
-        assigned_opts = sorted(flights_out["AssignedCarousel"].dropna().unique().tolist())
+        assigned_opts = sorted(display_df["AssignedCarousel"].dropna().unique().tolist())
         assigned_sel = st.multiselect("AssignedCarousel", assigned_opts, default=assigned_opts)
 
-        if "Terminal" in flights_out.columns:
-            term_opts = sorted(flights_out["Terminal"].dropna().unique().tolist())
+        if "Terminal" in display_df.columns:
+            term_opts = sorted(display_df["Terminal"].dropna().unique().tolist())
             term_sel = st.multiselect("Terminal", term_opts, default=term_opts)
         else:
             term_sel = None
 
-        cat_opts = sorted(flights_out["Category"].dropna().unique().tolist())
+        cat_opts = sorted(display_df["Category"].dropna().unique().tolist())
         cat_sel = st.multiselect("Category", cat_opts, default=cat_opts)
 
-    filtered = flights_out.copy()
+        legend_opts = sorted(display_df["LegendCategory"].dropna().unique().tolist())
+        legend_sel = st.multiselect("Type (legend)", legend_opts, default=legend_opts)
+
+    filtered = display_df.copy()
     if assigned_sel:
         filtered = filtered[filtered["AssignedCarousel"].isin(assigned_sel)]
     if term_sel is not None:
@@ -1067,6 +1511,10 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
             filtered = filtered.iloc[0:0]
     if cat_sel:
         filtered = filtered[filtered["Category"].isin(cat_sel)]
+    else:
+        filtered = filtered.iloc[0:0]
+    if legend_sel:
+        filtered = filtered[filtered["LegendCategory"].isin(legend_sel)]
     else:
         filtered = filtered.iloc[0:0]
 
@@ -1080,12 +1528,26 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
     tmpdir = tempfile.mkdtemp()
     txt_path = os.path.join(tmpdir, "summary.txt")
     csv_path = os.path.join(tmpdir, "summary.csv")
+    txt_readjusted_path = os.path.join(tmpdir, "summary_readjusted.txt")
+    csv_readjusted_path = os.path.join(tmpdir, "summary_readjusted.csv")
     xlsx_path = os.path.join(tmpdir, "timeline.xlsx")
     readjusted_path = os.path.join(tmpdir, "timeline_readjusted.xlsx")
     extra_csv_path = os.path.join(tmpdir, "extra_makeups_needed.csv")
 
     write_summary_txt(txt_path, flights_out)
     write_summary_csv(csv_path, flights_out)
+    export_readjusted = flights_readjusted.drop(columns=["AssignmentSegments"], errors="ignore")
+    export_readjusted.sort_values("DepartureTime").to_csv(
+        csv_readjusted_path,
+        index=False,
+        encoding="utf-8",
+    )
+    export_readjusted.sort_values("DepartureTime").to_csv(
+        txt_readjusted_path,
+        index=False,
+        encoding="utf-8",
+        sep="|",
+    )
     write_timeline_excel(
         xlsx_path,
         timeline_df,
@@ -1093,14 +1555,18 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
         color_mode=results["color_mode"],
         wide_color=results["wide_color"],
         narrow_color=results["narrow_color"],
+        split_color=split_color,
+        narrow_wide_color=narrow_wide_color,
     )
     write_timeline_excel(
         readjusted_path,
         timeline_readjusted,
-        flights_out,
+        flights_readjusted,
         color_mode=results["color_mode"],
         wide_color=results["wide_color"],
         narrow_color=results["narrow_color"],
+        split_color=split_color,
+        narrow_wide_color=narrow_wide_color,
         extra_columns=extra_columns,
         extra_summary=extra_summary_df,
     )
@@ -1130,6 +1596,20 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
         data=open(extra_csv_path, "rb"),
         file_name="extra_makeups_needed.csv",
         key="dl_extra_makeups_needed",
+    )
+
+    readj_cols = st.columns(2)
+    readj_cols[0].download_button(
+        "summary_readjusted.csv",
+        data=open(csv_readjusted_path, "rb"),
+        file_name="summary_readjusted.csv",
+        key="dl_summary_readjusted_csv",
+    )
+    readj_cols[1].download_button(
+        "summary_readjusted.txt",
+        data=open(txt_readjusted_path, "rb"),
+        file_name="summary_readjusted.txt",
+        key="dl_summary_readjusted_txt",
     )
 
     st.markdown("**Planning**")
