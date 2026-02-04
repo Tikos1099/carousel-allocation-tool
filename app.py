@@ -3,7 +3,13 @@ import streamlit as st
 import pandas as pd
 import re
 import unicodedata
+import ast
+import json
+import uuid
+from datetime import date, datetime
 from pathlib import Path
+import numpy as np
+import altair as alt
 
 from allocator import (
     CarouselCapacity,
@@ -12,7 +18,7 @@ from allocator import (
     build_timeline_from_assignments,
     compute_single_assignment_segments,
 )
-from io_excel import write_summary_txt, write_summary_csv, write_timeline_excel
+from io_excel import write_summary_txt, write_summary_csv, write_timeline_excel, write_heatmap_excel
 
 BRAND_RED = "#D32F2F"
 BRAND_RED_DARK = "#B71C1C"
@@ -252,6 +258,735 @@ def _reset_after_carousels():
         st.session_state.pop(k, None)
 
 
+def _replace_bool_keywords(expr: str) -> str:
+    parts = re.split(r"('(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\")", expr)
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(r"\bAND\b", "and", parts[i], flags=re.IGNORECASE)
+        parts[i] = re.sub(r"\bOR\b", "or", parts[i], flags=re.IGNORECASE)
+        parts[i] = re.sub(r"\bNOT\b", "not", parts[i], flags=re.IGNORECASE)
+    return "".join(parts)
+
+
+def _split_if_then_else(expr: str) -> tuple[str, str, str] | None:
+    expr_strip = expr.strip()
+    if not re.match(r"^if\b", expr_strip, flags=re.IGNORECASE):
+        return None
+    remainder = re.sub(r"^if\b", "", expr_strip, flags=re.IGNORECASE).strip()
+    parts = re.split(r"\bthen\b", remainder, flags=re.IGNORECASE, maxsplit=1)
+    if len(parts) != 2:
+        raise ValueError("Expression if/then/else invalide (then manquant).")
+    cond = parts[0].strip()
+    rest = parts[1].strip()
+    parts2 = re.split(r"\belse\b", rest, flags=re.IGNORECASE, maxsplit=1)
+    if len(parts2) != 2:
+        raise ValueError("Expression if/then/else invalide (else manquant).")
+    then_expr = parts2[0].strip()
+    else_expr = parts2[1].strip()
+    if not cond or not then_expr or not else_expr:
+        raise ValueError("Expression if/then/else invalide (sections vides).")
+    return cond, then_expr, else_expr
+
+
+def _ensure_datetime(value):
+    if isinstance(value, pd.Series):
+        if pd.api.types.is_datetime64_any_dtype(value):
+            return value
+        return pd.to_datetime(value, errors="coerce")
+    return pd.to_datetime(value, errors="coerce")
+
+
+def _to_series(value, index: pd.Index) -> pd.Series:
+    if isinstance(value, pd.Series):
+        return value.reindex(index)
+    if isinstance(value, (np.ndarray, list, tuple, pd.Index)):
+        return pd.Series(value, index=index)
+    return pd.Series([value] * len(index), index=index)
+
+
+def _coerce_bool(value, index: pd.Index) -> pd.Series:
+    series = _to_series(value, index)
+    return series.fillna(False).astype(bool)
+
+
+def _eval_ast_expression(expr: str, df: pd.DataFrame):
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"Expression invalide: {exc.msg}") from exc
+
+    def _fn_diff_minutes(a, b):
+        a_dt = _ensure_datetime(a)
+        b_dt = _ensure_datetime(b)
+        if isinstance(a_dt, pd.Series) or isinstance(b_dt, pd.Series):
+            return (b_dt - a_dt).dt.total_seconds() / 60
+        delta = b_dt - a_dt
+        return delta.total_seconds() / 60 if pd.notna(delta) else np.nan
+
+    def _fn_hour(a):
+        dt = _ensure_datetime(a)
+        if isinstance(dt, pd.Series):
+            return dt.dt.hour
+        return dt.hour if pd.notna(dt) else np.nan
+
+    def _fn_day(a):
+        dt = _ensure_datetime(a)
+        if isinstance(dt, pd.Series):
+            return dt.dt.date
+        return dt.date() if pd.notna(dt) else np.nan
+
+    def _fn_isnull(a):
+        if isinstance(a, pd.Series):
+            return a.isna()
+        return pd.isna(a)
+
+    def _fn_contains(a, b):
+        series = _to_series(a, df.index).astype(str)
+        return series.str.contains(str(b), na=False)
+
+    def _fn_lower(a):
+        series = _to_series(a, df.index).astype(str)
+        return series.str.lower()
+
+    allowed_funcs = {
+        "diff_minutes": _fn_diff_minutes,
+        "hour": _fn_hour,
+        "day": _fn_day,
+        "isnull": _fn_isnull,
+        "contains": _fn_contains,
+        "lower": _fn_lower,
+    }
+
+    bin_ops = {
+        ast.Add: lambda a, b: a + b,
+        ast.Sub: lambda a, b: a - b,
+        ast.Mult: lambda a, b: a * b,
+        ast.Div: lambda a, b: a / b,
+    }
+
+    cmp_ops = {
+        ast.Eq: lambda a, b: a == b,
+        ast.NotEq: lambda a, b: a != b,
+        ast.Lt: lambda a, b: a < b,
+        ast.LtE: lambda a, b: a <= b,
+        ast.Gt: lambda a, b: a > b,
+        ast.GtE: lambda a, b: a >= b,
+    }
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id in df.columns:
+                return df[node.id]
+            raise ValueError(f"Colonne inconnue: {node.id}")
+        if isinstance(node, ast.BinOp):
+            op_type = type(node.op)
+            if op_type not in bin_ops:
+                raise ValueError("Operation non supportee.")
+            return bin_ops[op_type](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.UAdd):
+                return +_eval(node.operand)
+            if isinstance(node.op, ast.USub):
+                return -_eval(node.operand)
+            if isinstance(node.op, ast.Not):
+                return ~_coerce_bool(_eval(node.operand), df.index)
+            raise ValueError("Operation unaire non supportee.")
+        if isinstance(node, ast.BoolOp):
+            values = [_coerce_bool(_eval(v), df.index) for v in node.values]
+            if isinstance(node.op, ast.And):
+                out = values[0]
+                for v in values[1:]:
+                    out = out & v
+                return out
+            if isinstance(node.op, ast.Or):
+                out = values[0]
+                for v in values[1:]:
+                    out = out | v
+                return out
+            raise ValueError("Operation booleenne non supportee.")
+        if isinstance(node, ast.Compare):
+            left = _eval(node.left)
+            result = None
+            for op, comp in zip(node.ops, node.comparators):
+                op_type = type(op)
+                if op_type not in cmp_ops:
+                    raise ValueError("Comparaison non supportee.")
+                right = _eval(comp)
+                comp_val = cmp_ops[op_type](left, right)
+                result = comp_val if result is None else (result & comp_val)
+                left = right
+            return result
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Appel de fonction non supporte.")
+            func_name = node.func.id
+            if func_name not in allowed_funcs:
+                raise ValueError(f"Fonction non autorisee: {func_name}")
+            if node.keywords:
+                raise ValueError("Arguments nommes non supportes.")
+            args = [_eval(a) for a in node.args]
+            return allowed_funcs[func_name](*args)
+        raise ValueError("Expression non supportee.")
+
+    return _eval(tree)
+
+
+def _eval_expression(expr: str, df: pd.DataFrame):
+    expr_clean = _replace_bool_keywords(expr)
+    parsed = _split_if_then_else(expr_clean)
+    if parsed:
+        cond_expr, then_expr, else_expr = parsed
+        cond_val = _eval_expression(cond_expr, df)
+        then_val = _eval_expression(then_expr, df)
+        else_val = _eval_expression(else_expr, df)
+        cond_series = _coerce_bool(cond_val, df.index)
+        then_series = _to_series(then_val, df.index)
+        else_series = _to_series(else_val, df.index)
+        return pd.Series(np.where(cond_series, then_series, else_series), index=df.index)
+    return _eval_ast_expression(expr_clean, df)
+
+
+def _coerce_type(series: pd.Series, dtype: str) -> pd.Series:
+    if dtype == "number":
+        return pd.to_numeric(series, errors="coerce")
+    if dtype == "text":
+        return series.astype(str)
+    if dtype == "boolean":
+        return series.fillna(False).astype(bool)
+    if dtype == "datetime":
+        return pd.to_datetime(series, errors="coerce")
+    return series
+
+
+def _apply_calculated_fields(df: pd.DataFrame, variables: list[dict]) -> tuple[pd.DataFrame, list[str]]:
+    out = df.copy()
+    errors: list[str] = []
+    for var in variables:
+        name = var.get("name")
+        expr = var.get("expr")
+        dtype = var.get("dtype", "text")
+        if not name or not expr:
+            continue
+        try:
+            computed = _eval_expression(expr, out)
+            series = _to_series(computed, out.index)
+            out[name] = _coerce_type(series, dtype)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+    return out, errors
+
+
+def _get_datetime_columns(df: pd.DataFrame) -> list[str]:
+    cols: list[str] = []
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            cols.append(col)
+            continue
+        if "time" in col.lower() or "date" in col.lower():
+            sample = pd.to_datetime(df[col].dropna().head(50), errors="coerce")
+            if sample.notna().any():
+                cols.append(col)
+    return cols
+
+
+def _render_filters(df: pd.DataFrame, prefix: str, defaults: dict | None = None) -> dict:
+    defaults = defaults or {}
+    filters: dict = {}
+    if "Terminal" in df.columns:
+        options = sorted(df["Terminal"].dropna().astype(str).unique().tolist())
+        default_val = defaults.get("terminal", options)
+        if default_val is None:
+            default_val = options
+        default_val = [v for v in default_val if v in options]
+        terminal_sel = st.multiselect(
+            "Terminal",
+            options,
+            default=default_val,
+            key=f"{prefix}_terminal",
+        )
+        filters["terminal"] = terminal_sel
+    if "Category" in df.columns:
+        options = sorted(df["Category"].dropna().astype(str).unique().tolist())
+        default_val = defaults.get("category", options)
+        if default_val is None:
+            default_val = options
+        default_val = [v for v in default_val if v in options]
+        category_sel = st.multiselect(
+            "Category",
+            options,
+            default=default_val,
+            key=f"{prefix}_category",
+        )
+        filters["category"] = category_sel
+
+    dt_cols = _get_datetime_columns(df)
+    if dt_cols:
+        default_col = defaults.get("date_col")
+        if default_col not in dt_cols:
+            default_col = "DepartureTime" if "DepartureTime" in dt_cols else dt_cols[0]
+        date_col = st.selectbox(
+            "Date column",
+            dt_cols,
+            index=dt_cols.index(default_col),
+            key=f"{prefix}_date_col",
+        )
+        dt_series = pd.to_datetime(df[date_col], errors="coerce")
+        min_dt = dt_series.min()
+        max_dt = dt_series.max()
+        if pd.notna(min_dt) and pd.notna(max_dt):
+            default_range = defaults.get("date_range")
+            if not default_range:
+                default_range = (min_dt.date(), max_dt.date())
+            if default_range[0] < min_dt.date():
+                default_range = (min_dt.date(), default_range[1])
+            if default_range[1] > max_dt.date():
+                default_range = (default_range[0], max_dt.date())
+            date_range = st.date_input(
+                "Date range",
+                value=default_range,
+                min_value=min_dt.date(),
+                max_value=max_dt.date(),
+                key=f"{prefix}_date_range",
+            )
+            if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+                filters["date_col"] = date_col
+                filters["date_range"] = (date_range[0], date_range[1])
+    return filters
+
+
+def _apply_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFrame:
+    if not filters:
+        return df
+    out = df.copy()
+    if "terminal" in filters and "Terminal" in out.columns:
+        terminals = filters.get("terminal")
+        if terminals is not None:
+            if terminals:
+                out = out[out["Terminal"].astype(str).isin(terminals)]
+            else:
+                return out.iloc[0:0]
+    if "category" in filters and "Category" in out.columns:
+        cats = filters.get("category")
+        if cats is not None:
+            if cats:
+                out = out[out["Category"].astype(str).isin(cats)]
+            else:
+                return out.iloc[0:0]
+    date_col = filters.get("date_col")
+    date_range = filters.get("date_range")
+    if date_col and date_col in out.columns and date_range:
+        start, end = date_range
+        dt_series = pd.to_datetime(out[date_col], errors="coerce")
+        mask = (dt_series.dt.date >= start) & (dt_series.dt.date <= end)
+        out = out[mask]
+    return out
+
+
+def _aggregate_series(series: pd.Series, agg: str):
+    if agg == "count":
+        return series.count()
+    if agg == "count_distinct":
+        return series.nunique()
+    return series.agg(agg)
+
+
+def _aggregate_grouped(df: pd.DataFrame, group_cols: list[str], measure: str, agg: str) -> pd.DataFrame:
+    if agg == "count":
+        grouped = df.groupby(group_cols, dropna=False)[measure].count()
+    elif agg == "count_distinct":
+        grouped = df.groupby(group_cols, dropna=False)[measure].nunique()
+    else:
+        grouped = df.groupby(group_cols, dropna=False)[measure].agg(agg)
+    return grouped.reset_index(name="value")
+
+
+def _altair_field_type(series: pd.Series) -> str:
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "T"
+    if pd.api.types.is_numeric_dtype(series):
+        return "Q"
+    if series.dropna().apply(lambda v: isinstance(v, (pd.Timestamp, datetime, date))).any():
+        return "T"
+    return "N"
+
+
+def _build_timeline_long(timeline_df: pd.DataFrame) -> pd.DataFrame:
+    if timeline_df is None or timeline_df.empty:
+        return pd.DataFrame(columns=["Timestamp", "Carousel", "Value"])
+    long_df = timeline_df.copy()
+    long_df = long_df.reset_index().rename(columns={long_df.index.name or "index": "Timestamp"})
+    long_df = long_df.melt(id_vars=["Timestamp"], var_name="Carousel", value_name="Value")
+    return long_df
+
+
+def _build_carousels_df(timeline_df: pd.DataFrame | None, flights_df: pd.DataFrame | None) -> pd.DataFrame:
+    names = []
+    if timeline_df is not None and not timeline_df.empty:
+        names.extend([str(c) for c in timeline_df.columns])
+    if not names and flights_df is not None and "AssignedCarousel" in flights_df.columns:
+        names.extend([str(x) for x in flights_df["AssignedCarousel"].dropna().unique().tolist()])
+    seen = set()
+    rows = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        terminal = None
+        carousel = name
+        if "-" in name:
+            parts = name.split("-", 1)
+            terminal = parts[0].strip()
+            carousel = parts[1].strip()
+        rows.append({"CarouselKey": name, "Carousel": carousel, "Terminal": terminal})
+    return pd.DataFrame(rows)
+
+
+def _serialize_filters(filters: dict | None) -> dict | None:
+    if not filters:
+        return None
+    payload = dict(filters)
+    if "date_range" in payload and payload["date_range"]:
+        start, end = payload["date_range"]
+        payload["date_range"] = (
+            start.isoformat() if isinstance(start, date) else start,
+            end.isoformat() if isinstance(end, date) else end,
+        )
+    return payload
+
+
+def _deserialize_filters(filters: dict | None) -> dict | None:
+    if not filters:
+        return None
+    payload = dict(filters)
+    if "date_range" in payload and payload["date_range"]:
+        start, end = payload["date_range"]
+        try:
+            start_date = date.fromisoformat(start)
+            end_date = date.fromisoformat(end)
+            payload["date_range"] = (start_date, end_date)
+        except Exception:
+            payload.pop("date_range", None)
+    return payload
+
+
+def _render_analytics_page():
+    st.header("Analytics")
+
+    results = st.session_state.get("results")
+    if not results or results.get("flights_out") is None:
+        st.info("Exécutez une allocation pour generer les datasets (flights_out, timeline_df).")
+        return
+
+    flights_df = results.get("flights_out")
+    timeline_df = results.get("timeline_df")
+    sources = {
+        "Flights": flights_df,
+    }
+    if timeline_df is not None:
+        sources["Timeline"] = _build_timeline_long(timeline_df)
+    sources["Carrousels"] = _build_carousels_df(timeline_df, flights_df)
+
+    st.session_state.setdefault("analytics_vars", [])
+    st.session_state.setdefault("analytics_kpis", [])
+    st.session_state.setdefault("analytics_charts", [])
+    st.session_state.setdefault("analytics_filters", {})
+
+    with st.sidebar:
+        st.header("Analytics")
+        st.subheader("Filtres globaux")
+        global_filters = _render_filters(
+            flights_df,
+            prefix="global_filters",
+            defaults=st.session_state.get("analytics_filters"),
+        )
+        st.session_state["analytics_filters"] = global_filters
+
+        st.subheader("Variables calculees")
+        st.caption(
+            "Formules supportees: + - * /, if/then/else, diff_minutes(a,b), hour(a), day(a), "
+            "isnull(x), contains(x, 'text'), lower(x), comparaisons (==, !=, <, <=, >, >=)."
+        )
+        with st.form("add_calc_var"):
+            source_name = st.selectbox("Source", list(sources.keys()), key="calc_source")
+            var_name = st.text_input("Nom variable", key="calc_name")
+            var_type = st.selectbox(
+                "Type",
+                ["number", "text", "boolean", "datetime"],
+                key="calc_type",
+            )
+            var_expr = st.text_area("Formule", key="calc_expr", height=80)
+            submit_var = st.form_submit_button("Ajouter / Mettre a jour")
+
+        if submit_var:
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", var_name or ""):
+                st.error("Nom de variable invalide (utilisez lettres, chiffres, underscore).")
+            else:
+                base_df = sources[source_name]
+                if base_df is None or base_df.empty:
+                    st.error("Source vide: impossible de valider la formule.")
+                else:
+                    try:
+                        _eval_expression(var_expr, base_df.head(200))
+                        vars_list = st.session_state["analytics_vars"]
+                        existing = [v for v in vars_list if v["name"] == var_name and v["source"] == source_name]
+                        payload = {
+                            "name": var_name,
+                            "source": source_name,
+                            "dtype": var_type,
+                            "expr": var_expr,
+                        }
+                        if existing:
+                            idx = vars_list.index(existing[0])
+                            vars_list[idx] = payload
+                        else:
+                            vars_list.append(payload)
+                        st.session_state["analytics_vars"] = vars_list
+                        st.success("Variable enregistree.")
+                    except Exception as exc:
+                        st.error(f"Formule invalide: {exc}")
+
+        if st.session_state["analytics_vars"]:
+            st.markdown("Variables existantes")
+            for var in list(st.session_state["analytics_vars"]):
+                cols = st.columns([5, 1])
+                cols[0].write(f"{var['name']} ({var['source']}) = {var['expr']}")
+                if cols[1].button("Supprimer", key=f"del_var_{var['source']}_{var['name']}"):
+                    st.session_state["analytics_vars"] = [
+                        v for v in st.session_state["analytics_vars"]
+                        if not (v["name"] == var["name"] and v["source"] == var["source"])
+                    ]
+                    st.rerun()
+
+        with st.expander("Dashboard config", expanded=False):
+            config_payload = {
+                "version": 1,
+                "filters": _serialize_filters(st.session_state.get("analytics_filters")),
+                "variables": st.session_state.get("analytics_vars", []),
+                "kpis": st.session_state.get("analytics_kpis", []),
+                "charts": st.session_state.get("analytics_charts", []),
+            }
+            st.download_button(
+                "Save dashboard config",
+                data=json.dumps(config_payload, indent=2),
+                file_name="dashboard_config.json",
+                key="dl_dashboard_config",
+            )
+            uploaded_config = st.file_uploader(
+                "Load config (JSON)",
+                type=["json"],
+                key="upload_dashboard_config",
+            )
+            if uploaded_config:
+                try:
+                    loaded = json.loads(uploaded_config.read().decode("utf-8"))
+                    st.session_state["analytics_vars"] = loaded.get("variables", [])
+                    st.session_state["analytics_kpis"] = loaded.get("kpis", [])
+                    st.session_state["analytics_charts"] = loaded.get("charts", [])
+                    st.session_state["analytics_filters"] = _deserialize_filters(loaded.get("filters")) or {}
+                    st.success("Config chargee.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Config invalide: {exc}")
+
+    st.subheader("Add KPI")
+    with st.form("add_kpi_form"):
+        kpi_title = st.text_input("Titre KPI", key="kpi_title")
+        kpi_source = st.selectbox("Source", list(sources.keys()), key="kpi_source")
+        use_global = st.checkbox("Utiliser filtres globaux", value=True, key="kpi_use_global")
+        kpi_filters = {}
+        if not use_global and sources.get(kpi_source) is not None:
+            kpi_filters = _render_filters(
+                sources[kpi_source],
+                prefix="kpi_filters",
+            )
+        base_df, var_errors = _apply_calculated_fields(
+            sources[kpi_source],
+            [v for v in st.session_state["analytics_vars"] if v["source"] == kpi_source],
+        )
+        if var_errors:
+            st.warning("Erreurs variables: " + " | ".join(var_errors))
+        measure_options = sorted(base_df.columns.tolist())
+        kpi_measure = st.selectbox("Mesure", measure_options, key="kpi_measure")
+        kpi_agg = st.selectbox(
+            "Aggregation",
+            ["sum", "mean", "count", "count_distinct", "min", "max"],
+            key="kpi_agg",
+        )
+        add_kpi = st.form_submit_button("Ajouter KPI")
+
+    if add_kpi:
+        kpi_entry = {
+            "id": str(uuid.uuid4()),
+            "title": kpi_title or f"{kpi_agg}({kpi_measure})",
+            "source": kpi_source,
+            "measure": kpi_measure,
+            "agg": kpi_agg,
+            "use_global": use_global,
+            "filters": kpi_filters,
+        }
+        st.session_state["analytics_kpis"].append(kpi_entry)
+        st.success("KPI ajoute.")
+
+    st.subheader("Add Chart")
+    with st.form("add_chart_form"):
+        chart_title = st.text_input("Titre chart", key="chart_title")
+        chart_source = st.selectbox("Source", list(sources.keys()), key="chart_source")
+        chart_type = st.selectbox("Type", ["table", "bar", "line", "pie"], key="chart_type")
+        use_global_chart = st.checkbox("Utiliser filtres globaux", value=True, key="chart_use_global")
+        chart_filters = {}
+        if not use_global_chart and sources.get(chart_source) is not None:
+            chart_filters = _render_filters(
+                sources[chart_source],
+                prefix="chart_filters",
+            )
+        base_df, var_errors = _apply_calculated_fields(
+            sources[chart_source],
+            [v for v in st.session_state["analytics_vars"] if v["source"] == chart_source],
+        )
+        if var_errors:
+            st.warning("Erreurs variables: " + " | ".join(var_errors))
+        chart_columns = base_df.columns.tolist()
+        x_dim = st.selectbox("X (dimension)", chart_columns, key="chart_x")
+        y_measure = st.selectbox("Y (mesure)", chart_columns, key="chart_y")
+        y_agg = st.selectbox(
+            "Aggregation",
+            ["sum", "mean", "count", "count_distinct", "min", "max"],
+            key="chart_agg",
+        )
+        series_options = ["(none)"] + chart_columns
+        series_col = st.selectbox("Serie (color)", series_options, key="chart_series")
+        top_n = st.number_input("Top N", min_value=0, value=0, step=1, key="chart_topn")
+        sort_order = st.selectbox("Tri", ["desc", "asc"], key="chart_sort")
+        add_chart = st.form_submit_button("Ajouter chart")
+
+    if add_chart:
+        chart_entry = {
+            "id": str(uuid.uuid4()),
+            "title": chart_title or f"{chart_type} {x_dim} / {y_agg}({y_measure})",
+            "source": chart_source,
+            "type": chart_type,
+            "x": x_dim,
+            "y": y_measure,
+            "agg": y_agg,
+            "series": None if series_col == "(none)" else series_col,
+            "top_n": int(top_n) if top_n else 0,
+            "sort": sort_order,
+            "use_global": use_global_chart,
+            "filters": chart_filters,
+        }
+        st.session_state["analytics_charts"].append(chart_entry)
+        st.success("Chart ajoute.")
+
+    st.subheader("Dashboard")
+    if not st.session_state["analytics_kpis"] and not st.session_state["analytics_charts"]:
+        st.info("Ajoutez des KPI ou des charts pour construire votre dashboard.")
+        return
+
+    if st.session_state["analytics_kpis"]:
+        st.markdown("KPI")
+        kpi_items = list(st.session_state["analytics_kpis"])
+        for row_start in range(0, len(kpi_items), 4):
+            row = kpi_items[row_start:row_start + 4]
+            kpi_cols = st.columns(4)
+            for idx, kpi in enumerate(row):
+                df_source = sources.get(kpi["source"])
+                if df_source is None or df_source.empty:
+                    continue
+                df_calc, var_errors = _apply_calculated_fields(
+                    df_source,
+                    [v for v in st.session_state["analytics_vars"] if v["source"] == kpi["source"]],
+                )
+                if var_errors:
+                    st.warning("Erreurs variables: " + " | ".join(var_errors))
+                if kpi.get("use_global"):
+                    df_calc = _apply_filters(df_calc, st.session_state.get("analytics_filters"))
+                df_calc = _apply_filters(df_calc, kpi.get("filters"))
+                if kpi["measure"] not in df_calc.columns:
+                    continue
+                value = _aggregate_series(df_calc[kpi["measure"]], kpi["agg"])
+                col = kpi_cols[idx]
+                col.metric(kpi["title"], value)
+                if col.button("Supprimer", key=f"del_kpi_{kpi['id']}"):
+                    st.session_state["analytics_kpis"] = [
+                        item for item in st.session_state["analytics_kpis"] if item["id"] != kpi["id"]
+                    ]
+                    st.rerun()
+
+    if st.session_state["analytics_charts"]:
+        st.markdown("Charts")
+        for chart in list(st.session_state["analytics_charts"]):
+            st.markdown(f"**{chart['title']}**")
+            df_source = sources.get(chart["source"])
+            if df_source is None or df_source.empty:
+                st.info("Source vide.")
+                continue
+            df_calc, var_errors = _apply_calculated_fields(
+                df_source,
+                [v for v in st.session_state["analytics_vars"] if v["source"] == chart["source"]],
+            )
+            if var_errors:
+                st.warning("Erreurs variables: " + " | ".join(var_errors))
+            if chart.get("use_global"):
+                df_calc = _apply_filters(df_calc, st.session_state.get("analytics_filters"))
+            df_calc = _apply_filters(df_calc, chart.get("filters"))
+            if chart["x"] not in df_calc.columns or chart["y"] not in df_calc.columns:
+                st.warning("Colonnes manquantes pour ce chart.")
+                continue
+            group_cols = [chart["x"]]
+            if chart.get("series"):
+                group_cols.append(chart["series"])
+            agg_df = _aggregate_grouped(df_calc, group_cols, chart["y"], chart["agg"])
+
+            if chart.get("top_n"):
+                if chart.get("series"):
+                    totals = agg_df.groupby(chart["x"])["value"].sum().sort_values(ascending=False)
+                    keep = totals.head(int(chart["top_n"])).index
+                    agg_df = agg_df[agg_df[chart["x"]].isin(keep)]
+                else:
+                    agg_df = agg_df.sort_values("value", ascending=False).head(int(chart["top_n"]))
+
+            if chart["type"] in ["bar", "pie", "table"]:
+                agg_df = agg_df.sort_values("value", ascending=(chart["sort"] == "asc"))
+            if chart["type"] == "line":
+                agg_df = agg_df.sort_values(chart["x"])
+
+            if chart["type"] == "table":
+                st.dataframe(agg_df, use_container_width=True)
+            else:
+                x_type = _altair_field_type(agg_df[chart["x"]])
+                x_field = f"{chart['x']}:{x_type}"
+                if chart["type"] == "bar":
+                    chart_obj = alt.Chart(agg_df).mark_bar().encode(
+                        x=alt.X(x_field, sort=None),
+                        y=alt.Y("value:Q"),
+                        color=alt.Color(f"{chart['series']}:N") if chart.get("series") else alt.value(BRAND_RED),
+                        tooltip=list(agg_df.columns),
+                    )
+                elif chart["type"] == "line":
+                    chart_obj = alt.Chart(agg_df).mark_line(point=True).encode(
+                        x=alt.X(x_field, sort=None),
+                        y=alt.Y("value:Q"),
+                        color=alt.Color(f"{chart['series']}:N") if chart.get("series") else alt.value(BRAND_RED),
+                        tooltip=list(agg_df.columns),
+                    )
+                else:
+                    chart_obj = alt.Chart(agg_df).mark_arc().encode(
+                        theta=alt.Theta("value:Q"),
+                        color=alt.Color(f"{chart['series']}:N") if chart.get("series") else alt.Color(f"{chart['x']}:N"),
+                        tooltip=list(agg_df.columns),
+                    )
+                st.altair_chart(chart_obj, use_container_width=True)
+
+            if st.button("Supprimer", key=f"del_chart_{chart['id']}"):
+                st.session_state["analytics_charts"] = [
+                    item for item in st.session_state["analytics_charts"] if item["id"] != chart["id"]
+                ]
+                st.rerun()
+
+
 def _apply_cat_term_mapping(df: pd.DataFrame, cat_mapping: dict, term_mapping: dict):
     warnings = []
     df = df.copy()
@@ -310,6 +1045,210 @@ def _build_extra_terms_and_defaults(
     wide_def, nar_def = _default_extra_caps_from_caps(caps_manual)
     defaults = {t: (wide_def, nar_def) for t in terminals}
     return terminals, defaults
+
+
+def _normalize_segments(value: object) -> list[dict[str, object]]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [seg for seg in value if isinstance(seg, dict)]
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in ("nan", "none"):
+            return []
+        try:
+            parsed = ast.literal_eval(text)
+        except Exception:
+            return []
+        return _normalize_segments(parsed)
+    return []
+
+
+def _has_assignment_segments(flights_df: pd.DataFrame) -> bool:
+    if flights_df is None or "AssignmentSegments" not in flights_df.columns:
+        return False
+    return flights_df["AssignmentSegments"].apply(lambda v: len(_normalize_segments(v)) > 0).any()
+
+
+def _ensure_segments_for_heatmap(
+    flights_df: pd.DataFrame,
+    caps: dict[str, CarouselCapacity],
+) -> pd.DataFrame:
+    if flights_df is None:
+        return pd.DataFrame()
+    if flights_df.empty:
+        out = flights_df.copy()
+        if "AssignmentSegments" not in out.columns:
+            out["AssignmentSegments"] = [[] for _ in range(len(out))]
+        return out
+    if not caps:
+        out = flights_df.copy()
+        if "AssignmentSegments" not in out.columns:
+            out["AssignmentSegments"] = [[] for _ in range(len(out))]
+        return out
+    if _has_assignment_segments(flights_df):
+        return flights_df
+    try:
+        return compute_single_assignment_segments(flights_df, caps)
+    except Exception:
+        out = flights_df.copy()
+        out["AssignmentSegments"] = [[] for _ in range(len(out))]
+        return out
+
+
+def _compute_occupancy_arrays(
+    flights_df: pd.DataFrame,
+    timeline_index: pd.DatetimeIndex,
+    carousels: list[str],
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    size = len(timeline_index)
+    usage_wide = {c: np.zeros(size, dtype=int) for c in carousels}
+    usage_narrow = {c: np.zeros(size, dtype=int) for c in carousels}
+    if flights_df is None or flights_df.empty or size == 0:
+        return usage_wide, usage_narrow
+
+    for _, row in flights_df.iterrows():
+        open_t = pd.Timestamp(row.get("MakeupOpening"))
+        close_t = pd.Timestamp(row.get("MakeupClosing"))
+        if pd.isna(open_t) or pd.isna(close_t) or close_t <= open_t:
+            continue
+        start_idx = timeline_index.searchsorted(open_t, side="right") - 1
+        end_idx = timeline_index.searchsorted(close_t, side="left")
+        if start_idx < 0:
+            start_idx = 0
+        if end_idx > size:
+            end_idx = size
+        if start_idx >= end_idx:
+            continue
+
+        segments = _normalize_segments(row.get("AssignmentSegments"))
+        if not segments:
+            continue
+        for seg in segments:
+            carousel = str(seg.get("carousel", "")).strip()
+            if not carousel or carousel not in usage_wide:
+                continue
+            try:
+                wide_used = int(seg.get("wide_used", 0))
+            except Exception:
+                wide_used = 0
+            try:
+                narrow_used = int(seg.get("narrow_used", 0))
+            except Exception:
+                narrow_used = 0
+            if wide_used == 0 and narrow_used == 0:
+                continue
+            usage_wide[carousel][start_idx:end_idx] += wide_used
+            usage_narrow[carousel][start_idx:end_idx] += narrow_used
+
+    return usage_wide, usage_narrow
+
+
+def _extract_extra_carousels(columns: list[str], term: str | None = None) -> list[str]:
+    extras: list[str] = []
+    prefix = f"{term}-" if term else None
+    for col in columns or []:
+        name = str(col)
+        if prefix:
+            if not name.startswith(prefix):
+                continue
+            base = name[len(prefix):]
+        else:
+            base = name
+        if base.upper().startswith("EXTRA"):
+            extras.append(base)
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for extra in extras:
+        if extra not in seen:
+            seen.add(extra)
+            uniq.append(extra)
+    return uniq
+
+
+def _add_extras_to_caps(
+    caps: dict[str, CarouselCapacity] | None,
+    extras: list[str],
+    extra_cap: CarouselCapacity | None,
+) -> dict[str, CarouselCapacity]:
+    out = dict(caps or {})
+    if extra_cap is None:
+        return out
+    for extra in extras:
+        if extra not in out:
+            out[extra] = CarouselCapacity(int(extra_cap.wide), int(extra_cap.narrow))
+    return out
+
+
+def _build_heatmap_frames(
+    flights_df: pd.DataFrame,
+    timeline_index: pd.DatetimeIndex,
+    caps: dict[str, CarouselCapacity],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    flights_seg = _ensure_segments_for_heatmap(flights_df, caps)
+    carousels = list(caps.keys())
+    usage_wide, usage_narrow = _compute_occupancy_arrays(flights_seg, timeline_index, carousels)
+
+    data_occ: dict[str, object] = {}
+    data_free: dict[str, object] = {}
+    for carousel in carousels:
+        wide_occ = usage_wide.get(carousel, np.zeros(len(timeline_index), dtype=int))
+        nar_occ = usage_narrow.get(carousel, np.zeros(len(timeline_index), dtype=int))
+        data_occ[f"{carousel}_Wide"] = wide_occ
+        data_occ[f"{carousel}_Narrow"] = nar_occ
+        cap = caps.get(carousel)
+        cap_wide = int(cap.wide) if cap else 0
+        cap_nar = int(cap.narrow) if cap else 0
+        data_free[f"{carousel}_Wide"] = cap_wide - wide_occ
+        data_free[f"{carousel}_Narrow"] = cap_nar - nar_occ
+
+    occ_df = pd.DataFrame(data_occ, index=timeline_index)
+    free_df = pd.DataFrame(data_free, index=timeline_index)
+    return occ_df, free_df
+
+
+def _build_heatmap_sheets(
+    flights_df: pd.DataFrame,
+    timeline_index: pd.DatetimeIndex,
+    timeline_columns: list[str],
+    *,
+    carousels_mode: str | None,
+    caps_manual: dict[str, CarouselCapacity] | None,
+    caps_by_terminal: dict[str, dict[str, CarouselCapacity]] | None,
+    extra_caps_by_terminal: dict[str, CarouselCapacity] | None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    occ_sheets: dict[str, pd.DataFrame] = {}
+    free_sheets: dict[str, pd.DataFrame] = {}
+
+    if carousels_mode == "file" and caps_by_terminal:
+        for term, caps_term in caps_by_terminal.items():
+            df_term = flights_df
+            if df_term is not None and "Terminal" in df_term.columns:
+                df_term = df_term[df_term["Terminal"].astype(str) == str(term)]
+            else:
+                df_term = df_term.iloc[0:0] if df_term is not None else df_term
+            extras = _extract_extra_carousels(timeline_columns, term)
+            extra_cap = extra_caps_by_terminal.get(term) if extra_caps_by_terminal else None
+            caps_full = _add_extras_to_caps(caps_term, extras, extra_cap)
+            occ_df, free_df = _build_heatmap_frames(df_term, timeline_index, caps_full)
+            occ_sheets[str(term)] = occ_df
+            free_sheets[str(term)] = free_df
+    else:
+        extras = _extract_extra_carousels(timeline_columns)
+        extra_cap = extra_caps_by_terminal.get("ALL") if extra_caps_by_terminal else None
+        caps_full = _add_extras_to_caps(caps_manual, extras, extra_cap)
+        occ_df, free_df = _build_heatmap_frames(flights_df, timeline_index, caps_full)
+        occ_sheets["Planning"] = occ_df
+        free_sheets["Planning"] = free_df
+
+    if not occ_sheets:
+        empty = pd.DataFrame(index=timeline_index)
+        occ_sheets["Planning"] = empty
+        free_sheets["Planning"] = empty
+
+    return occ_sheets, free_sheets
 
 
 def _readjust_terminal_allocations(
@@ -491,6 +1430,16 @@ def _readjust_terminal_allocations(
 
     return readjusted, timeline_term, extras_used, impossible_df
 
+
+page = st.sidebar.radio(
+    "Page",
+    options=["Allocation", "Analytics"],
+    index=0,
+    key="page_select",
+)
+if page == "Analytics":
+    _render_analytics_page()
+    st.stop()
 
 st.subheader("Etape 1 - Upload fichier vols")
 uploaded = st.file_uploader("Chargez le fichier Excel des vols", type=["xlsx"], key="flights_file")
@@ -1559,6 +2508,8 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
     csv_readjusted_path = os.path.join(tmpdir, "summary_readjusted.csv")
     xlsx_path = os.path.join(tmpdir, "timeline.xlsx")
     readjusted_path = os.path.join(tmpdir, "timeline_readjusted.xlsx")
+    heatmap_occ_path = os.path.join(tmpdir, "heatmap_positions_occupied.xlsx")
+    heatmap_free_path = os.path.join(tmpdir, "heatmap_positions_free.xlsx")
     extra_csv_path = os.path.join(tmpdir, "extra_makeups_needed.csv")
 
     write_summary_txt(txt_path, flights_out, extra_cols=keep_extra_cols)
@@ -1597,6 +2548,18 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
         extra_columns=extra_columns,
         extra_summary=extra_summary_df,
     )
+
+    heatmap_occ_sheets, heatmap_free_sheets = _build_heatmap_sheets(
+        flights_readjusted,
+        timeline_readjusted.index,
+        list(timeline_readjusted.columns),
+        carousels_mode=st.session_state.get("carousels_mode"),
+        caps_manual=st.session_state.get("caps_manual"),
+        caps_by_terminal=st.session_state.get("caps_by_terminal"),
+        extra_caps_by_terminal=extra_caps_by_terminal,
+    )
+    write_heatmap_excel(heatmap_occ_path, heatmap_occ_sheets, mode="occupied")
+    write_heatmap_excel(heatmap_free_path, heatmap_free_sheets, mode="free")
 
     if extra_makeups_df is not None:
         extra_makeups_df.to_csv(extra_csv_path, index=False, encoding="utf-8")
@@ -1652,6 +2615,21 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
         data=open(readjusted_path, "rb"),
         file_name="timeline_readjusted.xlsx",
         key="dl_timeline_readjusted",
+    )
+
+    st.markdown("**Heatmaps**")
+    heat_cols = st.columns(2)
+    heat_cols[0].download_button(
+        "heatmap_positions_occupied.xlsx",
+        data=open(heatmap_occ_path, "rb"),
+        file_name="heatmap_positions_occupied.xlsx",
+        key="dl_heatmap_occupied",
+    )
+    heat_cols[1].download_button(
+        "heatmap_positions_free.xlsx",
+        data=open(heatmap_free_path, "rb"),
+        file_name="heatmap_positions_free.xlsx",
+        key="dl_heatmap_free",
     )
 
     st.markdown("**Diagnostics**")
