@@ -52,6 +52,19 @@ def _consume(category: str, positions: int, free_wide: int, free_narrow: int) ->
     use_narrow = rem
     return free_wide - use_wide, free_narrow - use_narrow
 
+def _wide_only_possible(
+    free: Dict[str, Dict[str, int]],
+    positions: int,
+    max_carousels: int,
+) -> bool:
+    if max_carousels <= 0:
+        return False
+    caps = [int(v.get("wide", 0)) for v in free.values()]
+    if not caps:
+        return False
+    caps.sort(reverse=True)
+    return sum(caps[: min(max_carousels, len(caps))]) >= positions
+
 def _build_timeline_from_assignments(
     flights_out: pd.DataFrame,
     carousels: List[str],
@@ -224,13 +237,21 @@ def allocate_round_robin(
             flights.loc[idx, "UnassignedReason"] = "IMPOSSIBLE_DEMAND"
             continue
 
+        wide_only_available = False
+        if cat == "wide":
+            wide_only_available = any(free[c]["wide"] >= pos for c in carousels)
+
         # Try carousels starting from rr_idx (round robin)
         assigned = None
         tried = 0
         while tried < len(carousels):
             c = carousels[(rr_idx + tried) % len(carousels)]
             fw, fn = free[c]["wide"], free[c]["narrow"]
-            if _can_fit(cat, pos, fw, fn):
+            if cat == "wide" and wide_only_available:
+                fits = fw >= pos
+            else:
+                fits = _can_fit(cat, pos, fw, fn)
+            if fits:
                 # consume
                 new_fw, new_fn = _consume(cat, pos, fw, fn)
                 wide_used = fw - new_fw
@@ -272,6 +293,320 @@ def allocate_round_robin(
         flight_col=flight_col,
     )
     return flights_out, timeline_df
+
+def _max_possible_capacity_with_extras(
+    carousel_caps: Dict[str, CarouselCapacity],
+    extra_capacity: Optional[CarouselCapacity],
+    category: str,
+    max_carousels: int,
+    allow_extras: bool,
+) -> int:
+    if max_carousels <= 0:
+        return 0
+    category = _normalize_category(category)
+    caps: List[int] = []
+    for cap in carousel_caps.values():
+        if category == "wide":
+            caps.append(int(cap.wide) + int(cap.narrow))
+        else:
+            caps.append(int(cap.narrow))
+    if allow_extras and extra_capacity is not None:
+        if category == "wide":
+            extra_val = int(extra_capacity.wide) + int(extra_capacity.narrow)
+        else:
+            extra_val = int(extra_capacity.narrow)
+        # Extras can be added as needed; cap by max_carousels for a single flight.
+        caps.extend([extra_val] * max_carousels)
+    if not caps:
+        return 0
+    caps.sort(reverse=True)
+    return sum(caps[: min(max_carousels, len(caps))])
+
+def allocate_round_robin_with_rules(
+    flights: pd.DataFrame,
+    carousel_caps: Dict[str, CarouselCapacity],
+    time_step_minutes: int,
+    start_time: pd.Timestamp,
+    end_time: pd.Timestamp,
+    *,
+    category_col="Category",
+    pos_col="Positions",
+    open_col="MakeupOpening",
+    close_col="MakeupClosing",
+    dep_col="DepartureTime",
+    flight_col="FlightNumber",
+    max_carousels_per_flight_narrow: int = 1,
+    max_carousels_per_flight_wide: int = 1,
+    rule_order: Optional[List[str]] = None,
+    extra_capacity: Optional[CarouselCapacity] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], pd.DataFrame]:
+    if time_step_minutes <= 0:
+        raise ValueError("time_step_minutes must be > 0")
+
+    rule_order = rule_order or []
+    max_carousels_per_flight_narrow = max(1, int(max_carousels_per_flight_narrow))
+    max_carousels_per_flight_wide = max(1, int(max_carousels_per_flight_wide))
+
+    if flights is None or len(flights) == 0:
+        empty = flights.copy() if flights is not None else pd.DataFrame()
+        timeline = _build_timeline_from_assignments(
+            empty,
+            list(carousel_caps.keys()),
+            time_step_minutes,
+            start_time,
+            end_time,
+            open_col=open_col,
+            close_col=close_col,
+            flight_col=flight_col,
+        )
+        return empty, timeline, [], empty.iloc[0:0].copy()
+
+    flights = flights.copy()
+    flights["OriginalCategory"] = flights[category_col].astype(str).str.strip()
+    flights["FinalCategory"] = flights["OriginalCategory"]
+    flights["CategoryChanged"] = "NO"
+    flights["AssignedCarousels"] = [[] for _ in range(len(flights))]
+    flights["AssignmentSegments"] = [[] for _ in range(len(flights))]
+    flights["SplitCount"] = 0
+    flights["AssignedCarousel"] = "UNASSIGNED"
+    flights["UnassignedReason"] = ""
+
+    flights = flights.sort_values([open_col, dep_col]).reset_index(drop=False).rename(columns={"index": "_rowid"})
+
+    current_caps = dict(carousel_caps)
+    carousels = list(current_caps.keys())
+    extras_used: List[str] = []
+
+    active = {c: [] for c in carousels}
+    free = {
+        c: {"wide": int(current_caps[c].wide), "narrow": int(current_caps[c].narrow)}
+        for c in carousels
+    }
+    rr_idx = 0
+
+    def release_until(t: pd.Timestamp):
+        for c in carousels:
+            still = []
+            for item in active[c]:
+                if item["close"] <= t:
+                    free[c]["wide"] += item["wide_used"]
+                    free[c]["narrow"] += item["narrow_used"]
+                else:
+                    still.append(item)
+            active[c] = still
+
+    def _ensure_extra():
+        nonlocal carousels, active, free
+        if extra_capacity is None:
+            return None
+        name = f"EXTRA{len(extras_used) + 1}"
+        extras_used.append(name)
+        current_caps[name] = CarouselCapacity(int(extra_capacity.wide), int(extra_capacity.narrow))
+        carousels.append(name)
+        active[name] = []
+        free[name] = {"wide": int(extra_capacity.wide), "narrow": int(extra_capacity.narrow)}
+        return name
+
+    def _current_max(allow_multi: bool, alloc_cat: str) -> int:
+        if not allow_multi:
+            return 1
+        return max_carousels_per_flight_wide if alloc_cat == "wide" else max_carousels_per_flight_narrow
+
+    def _assign_one(
+        alloc_cat: str,
+        pos: int,
+        allow_multi: bool,
+    ) -> Tuple[List[str], List[Dict[str, object]]]:
+        nonlocal rr_idx
+        if not carousels:
+            return [], []
+
+        max_car = _current_max(allow_multi, alloc_cat)
+        wide_only_required = False
+        if alloc_cat == "wide":
+            if max_car <= 1:
+                wide_only_required = any(free[c]["wide"] >= pos for c in carousels)
+            else:
+                wide_only_required = _wide_only_possible(free, pos, max_car)
+
+        assigned_list: List[str] = []
+        segments: List[Dict[str, object]] = []
+
+        tried = 0
+        while tried < len(carousels):
+            c = carousels[(rr_idx + tried) % len(carousels)]
+            fw, fn = free[c]["wide"], free[c]["narrow"]
+            if wide_only_required:
+                fits = fw >= pos
+            else:
+                fits = _can_fit(alloc_cat, pos, fw, fn)
+            if fits:
+                new_fw, new_fn = _consume(alloc_cat, pos, fw, fn)
+                wide_used = fw - new_fw
+                narrow_used = fn - new_fn
+                free[c]["wide"], free[c]["narrow"] = new_fw, new_fn
+                active[c].append({
+                    "close": pd.Timestamp(current_close),
+                    "wide_used": wide_used,
+                    "narrow_used": narrow_used,
+                })
+                assigned_list = [c]
+                segments = [{
+                    "carousel": c,
+                    "wide_used": wide_used,
+                    "narrow_used": narrow_used,
+                }]
+                rr_idx = (rr_idx + tried + 1) % len(carousels)
+                return assigned_list, segments
+            tried += 1
+
+        if allow_multi and max_car > 1:
+            allocations = _select_split_allocations(
+                alloc_cat,
+                pos,
+                free,
+                carousels,
+                rr_idx,
+                max_car,
+                wide_only=wide_only_required,
+            )
+            if allocations:
+                for alloc in allocations:
+                    c = alloc["carousel"]
+                    free[c]["wide"] -= int(alloc["wide_used"])
+                    free[c]["narrow"] -= int(alloc["narrow_used"])
+                    active[c].append({
+                        "close": pd.Timestamp(current_close),
+                        "wide_used": int(alloc["wide_used"]),
+                        "narrow_used": int(alloc["narrow_used"]),
+                    })
+                    assigned_list.append(c)
+                    segments.append({
+                        "carousel": c,
+                        "wide_used": int(alloc["wide_used"]),
+                        "narrow_used": int(alloc["narrow_used"]),
+                    })
+                first_idx = carousels.index(assigned_list[0])
+                rr_idx = (first_idx + 1) % len(carousels)
+                return assigned_list, segments
+
+        return [], []
+
+    for _, row in flights.iterrows():
+        current_open = pd.Timestamp(row.get(open_col))
+        current_close = pd.Timestamp(row.get(close_col))
+        if pd.isna(current_open) or pd.isna(current_close):
+            continue
+        release_until(current_open)
+
+        orig_cat = _normalize_category(row.get(category_col))
+        pos = int(row.get(pos_col, 0))
+
+        allow_multi = False
+        allow_narrow_wide = False
+        allow_extras = False
+
+        assigned_list: List[str] = []
+        segments: List[Dict[str, object]] = []
+        alloc_cat = orig_cat
+
+        def attempt():
+            nonlocal alloc_cat, assigned_list, segments
+            alloc_cat = "wide" if allow_narrow_wide and orig_cat == "narrow" else orig_cat
+            assigned_list, segments = _assign_one(alloc_cat, pos, allow_multi)
+            return len(assigned_list) > 0
+
+        # Base attempt (no rules)
+        if not attempt():
+            for rule in rule_order:
+                if rule == "multi":
+                    allow_multi = True
+                elif rule == "narrow_wide":
+                    allow_narrow_wide = True
+                elif rule == "extras":
+                    allow_extras = True
+                else:
+                    continue
+
+                if rule == "extras":
+                    if attempt():
+                        break
+                    if extra_capacity is not None:
+                        max_car = _current_max(allow_multi, "wide" if (allow_narrow_wide and orig_cat == "narrow") else orig_cat)
+                        max_add = max_car if max_car > 0 else 1
+                        added = 0
+                        while added < max_add:
+                            _ensure_extra()
+                            added += 1
+                            if attempt():
+                                break
+                        if assigned_list:
+                            break
+                else:
+                    if attempt():
+                        break
+
+        rowid = row.get("_rowid")
+        idxs = flights.index[flights["_rowid"] == rowid]
+        if len(idxs) == 0:
+            continue
+        idx = idxs[0]
+
+        if assigned_list:
+            flights.at[idx, "AssignedCarousels"] = assigned_list
+            flights.at[idx, "AssignmentSegments"] = segments
+            flights.at[idx, "SplitCount"] = len(assigned_list)
+            flights.at[idx, "AssignedCarousel"] = assigned_list[0] if len(assigned_list) == 1 else "SPLIT"
+            flights.at[idx, "UnassignedReason"] = ""
+            if orig_cat == "narrow" and alloc_cat == "wide":
+                flights.at[idx, "FinalCategory"] = "Wide"
+                flights.at[idx, "CategoryChanged"] = "YES"
+            else:
+                flights.at[idx, "FinalCategory"] = flights.at[idx, "OriginalCategory"]
+                flights.at[idx, "CategoryChanged"] = "NO"
+        else:
+            final_cat = "wide" if (allow_narrow_wide and orig_cat == "narrow") else orig_cat
+            max_car = _current_max(allow_multi, final_cat)
+            max_possible = _max_possible_capacity_with_extras(
+                carousel_caps,
+                extra_capacity,
+                final_cat,
+                max_car,
+                allow_extras,
+            )
+            reason = "IMPOSSIBLE_DEMAND" if pos > max_possible else "NO_CAPACITY"
+            flights.at[idx, "AssignedCarousels"] = []
+            flights.at[idx, "AssignmentSegments"] = []
+            flights.at[idx, "SplitCount"] = 0
+            flights.at[idx, "AssignedCarousel"] = "UNASSIGNED"
+            flights.at[idx, "UnassignedReason"] = reason
+            flights.at[idx, "FinalCategory"] = flights.at[idx, "OriginalCategory"]
+            flights.at[idx, "CategoryChanged"] = "NO"
+
+    flights["Category"] = flights["FinalCategory"]
+    flights["AssignedCarousels"] = flights["AssignedCarousels"].apply(
+        lambda lst: "+".join(lst) if lst else "UNASSIGNED"
+    )
+    flights_out = flights.sort_values("_rowid").drop(columns=["_rowid"]).reset_index(drop=True)
+
+    carousels_list = list(carousel_caps.keys()) + extras_used
+    timeline_df = _build_timeline_from_assignments(
+        flights_out,
+        carousels_list,
+        time_step_minutes,
+        start_time,
+        end_time,
+        open_col=open_col,
+        close_col=close_col,
+        flight_col=flight_col,
+    )
+
+    impossible_df = flights_out[
+        (flights_out["AssignedCarousel"] == "UNASSIGNED")
+        & (flights_out["UnassignedReason"] == "IMPOSSIBLE_DEMAND")
+    ].copy()
+
+    return flights_out, timeline_df, extras_used, impossible_df
 
 def size_extra_makeups(
     flights: pd.DataFrame,
@@ -448,11 +783,11 @@ def compute_single_assignment_segments(
         })
 
         rowid = row.get("_rowid")
-        flights.loc[flights["_rowid"] == rowid, "AssignmentSegments"] = [[{
+        flights.loc[flights["_rowid"] == rowid, "AssignmentSegments"] = [{
             "carousel": assigned,
             "wide_used": wide_used,
             "narrow_used": narrow_used,
-        }]]
+        }]
 
     flights = flights.drop(columns=["_rowid"])
     return flights
@@ -464,6 +799,7 @@ def _select_split_allocations(
     carousels: List[str],
     rr_idx: int,
     max_carousels: int,
+    wide_only: bool = False,
 ) -> Optional[List[Dict[str, object]]]:
     if max_carousels <= 0 or not carousels:
         return None
@@ -471,7 +807,10 @@ def _select_split_allocations(
     candidates: List[Tuple[str, int, int]] = []
     for idx, c in enumerate(carousels):
         fw, fn = free[c]["wide"], free[c]["narrow"]
-        cap = (fw + fn) if category == "wide" else fn
+        if category == "wide":
+            cap = fw if wide_only else (fw + fn)
+        else:
+            cap = fn
         if cap > 0:
             order = (idx - rr_idx) % len(carousels)
             candidates.append((c, cap, order))
@@ -626,6 +965,12 @@ def allocate_with_fixed_assignments(
         pos = int(row.get(pos_col, 0))
         alloc_cat = "wide" if allow_narrow_use_wide and cat == "narrow" else cat
         max_car = max_carousels_per_flight_wide if alloc_cat == "wide" else max_carousels_per_flight_narrow
+        wide_only_required = False
+        if cat == "wide":
+            if max_car <= 1:
+                wide_only_required = any(free[c]["wide"] >= pos for c in carousels)
+            else:
+                wide_only_required = _wide_only_possible(free, pos, max_car)
 
         assigned_list: List[str] = []
         segments: List[Dict[str, object]] = []
@@ -638,7 +983,11 @@ def allocate_with_fixed_assignments(
             while tried < len(carousels):
                 c = carousels[(rr_idx + tried) % len(carousels)]
                 fw, fn = free[c]["wide"], free[c]["narrow"]
-                if _can_fit(alloc_cat, pos, fw, fn):
+                if wide_only_required:
+                    fits = fw >= pos
+                else:
+                    fits = _can_fit(alloc_cat, pos, fw, fn)
+                if fits:
                     new_fw, new_fn = _consume(alloc_cat, pos, fw, fn)
                     wide_used = fw - new_fw
                     narrow_used = fn - new_fn
@@ -659,7 +1008,15 @@ def allocate_with_fixed_assignments(
                 tried += 1
 
             if not assigned_list and max_car > 1:
-                allocations = _select_split_allocations(alloc_cat, pos, free, carousels, rr_idx, max_car)
+                allocations = _select_split_allocations(
+                    alloc_cat,
+                    pos,
+                    free,
+                    carousels,
+                    rr_idx,
+                    max_car,
+                    wide_only=wide_only_required,
+                )
                 if allocations:
                     for alloc in allocations:
                         c = alloc["carousel"]

@@ -14,6 +14,7 @@ import altair as alt
 from allocator import (
     CarouselCapacity,
     allocate_round_robin,
+    allocate_round_robin_with_rules,
     allocate_with_fixed_assignments,
     build_timeline_from_assignments,
     compute_single_assignment_segments,
@@ -2262,16 +2263,16 @@ if st.button("Run allocation", key="run_allocation"):
                 extra_cap = None
                 if rule_extras and extra_caps_by_terminal:
                     extra_cap = extra_caps_by_terminal.get(term)
-                readj_term, timeline_term, extras_used, impossible_df = _readjust_terminal_allocations(
-                    df_term,
-                    caps_term,
-                    extra_capacity=extra_cap,
+                readj_term, timeline_term, extras_used, impossible_df = allocate_round_robin_with_rules(
+                    flights=df_term,
+                    carousel_caps=caps_term,
                     time_step_minutes=int(current_time_step),
                     start_time=pd.Timestamp(start_time),
                     end_time=pd.Timestamp(end_time),
-                    max_carousels_narrow=max_carousels_narrow,
-                    max_carousels_wide=max_carousels_wide,
+                    max_carousels_per_flight_narrow=max_carousels_narrow,
+                    max_carousels_per_flight_wide=max_carousels_wide,
                     rule_order=rule_order,
+                    extra_capacity=extra_cap,
                 )
 
                 if timeline_term is not None and len(timeline_term.columns) > 0:
@@ -2319,16 +2320,16 @@ if st.button("Run allocation", key="run_allocation"):
             extra_cap = None
             if rule_extras and extra_caps_by_terminal:
                 extra_cap = extra_caps_by_terminal.get("ALL")
-            flights_readjusted, timeline_readjusted, extras_used, impossible_df = _readjust_terminal_allocations(
-                flights_out,
-                caps_manual,
-                extra_capacity=extra_cap,
+            flights_readjusted, timeline_readjusted, extras_used, impossible_df = allocate_round_robin_with_rules(
+                flights=flights_out,
+                carousel_caps=caps_manual,
                 time_step_minutes=int(current_time_step),
                 start_time=pd.Timestamp(start_time),
                 end_time=pd.Timestamp(end_time),
-                max_carousels_narrow=max_carousels_narrow,
-                max_carousels_wide=max_carousels_wide,
+                max_carousels_per_flight_narrow=max_carousels_narrow,
+                max_carousels_per_flight_wide=max_carousels_wide,
                 rule_order=rule_order,
+                extra_capacity=extra_cap,
             )
             timeline_readjusted = timeline_readjusted.reindex(timeline_df.index, fill_value="")
             extra_columns = extras_used
