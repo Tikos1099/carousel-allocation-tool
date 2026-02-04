@@ -172,6 +172,8 @@ def _reset_after_upload():
         "run_done",
         "results",
         "col_mapping",
+        "keep_extra_cols",
+        "keep_extra_cols_ui",
         "cat_mapping",
         "term_mapping",
         "makeup_signature",
@@ -615,6 +617,25 @@ if not mapping_confirmed:
     c_open = _selectbox("MakeupOpening (optionnel)", default_open, "map_open", st.session_state.get("map_open"))
     c_close = _selectbox("MakeupClosing (optionnel)", default_close, "map_close", st.session_state.get("map_close"))
 
+    st.markdown("**Colonnes supplementaires a conserver (optionnel)**")
+    selected_raw = {c_dep, c_flt, c_cat, c_pos, c_term, c_open, c_close}
+    selected_raw.discard("(Aucune)")
+    extra_candidates = [c for c in cols if c not in selected_raw]
+    if extra_candidates:
+        default_keep = extra_candidates
+        if "keep_extra_cols_ui" in st.session_state:
+            default_keep = st.session_state.get("keep_extra_cols_ui", [])
+        default_keep = [c for c in default_keep if c in extra_candidates]
+        keep_extra_cols = st.multiselect(
+            "Ces colonnes seront conservees dans summary/summary_readjusted.",
+            options=extra_candidates,
+            default=default_keep,
+            key="keep_extra_cols_ui",
+        )
+    else:
+        keep_extra_cols = []
+        st.caption("Aucune colonne supplementaire disponible.")
+
     if st.button("Confirmer mapping colonnes", key="confirm_mapping_cols"):
         missing = []
         if c_dep == "(Aucune)":
@@ -642,7 +663,9 @@ if not mapping_confirmed:
         if c_close != "(Aucune)":
             col_mapping[c_close] = "MakeupClosing"
 
+        keep_extra_cols = [c for c in (keep_extra_cols or []) if c in cols]
         st.session_state["col_mapping"] = col_mapping
+        st.session_state["keep_extra_cols"] = keep_extra_cols
         st.session_state["mapping_confirmed"] = True
         st.rerun()
 else:
@@ -1410,6 +1433,8 @@ if st.button("Run allocation", key="run_allocation"):
             "Count": int(len(unassigned_df)),
         })
 
+        keep_extra_cols = st.session_state.get("keep_extra_cols", [])
+
         st.session_state["results"] = {
             "flights_out": flights_out,
             "flights_readjusted": flights_readjusted,
@@ -1425,6 +1450,7 @@ if st.button("Run allocation", key="run_allocation"):
             "extra_columns": extra_columns,
             "extra_summary_df": extra_summary_df,
             "extra_makeups_df": extra_makeups_df,
+            "keep_extra_cols": keep_extra_cols,
         }
         st.session_state["run_done"] = True
         st.rerun()
@@ -1446,6 +1472,7 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
     extra_columns = results.get("extra_columns", [])
     extra_summary_df = results.get("extra_summary_df")
     extra_makeups_df = results.get("extra_makeups_df")
+    keep_extra_cols = results.get("keep_extra_cols", [])
     split_color = results.get("split_color", "#FFC107")
     narrow_wide_color = results.get("narrow_wide_color", "#00B894")
 
@@ -1534,7 +1561,7 @@ if st.session_state.get("run_done") and st.session_state.get("results"):
     readjusted_path = os.path.join(tmpdir, "timeline_readjusted.xlsx")
     extra_csv_path = os.path.join(tmpdir, "extra_makeups_needed.csv")
 
-    write_summary_txt(txt_path, flights_out)
+    write_summary_txt(txt_path, flights_out, extra_cols=keep_extra_cols)
     write_summary_csv(csv_path, flights_out)
     export_readjusted = flights_readjusted.drop(columns=["AssignmentSegments"], errors="ignore")
     export_readjusted.sort_values("DepartureTime").to_csv(
