@@ -1,11 +1,11 @@
-import subprocess
+﻿import subprocess
 import sys
 import webbrowser
 import time
 from pathlib import Path
 
 def main():
-    # dossier où se trouve app.py
+    # dossier oÃ¹ se trouve app.py
     base_dir = Path(__file__).resolve().parent
     app_path = base_dir / "app.py"
 
@@ -22,3 +22,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
