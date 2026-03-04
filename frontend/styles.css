@@ -387,6 +387,103 @@ table thead {
   font-size: 13px;
 }
 
+.builder-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.builder-actions .ghost {
+  padding: 8px 14px;
+}
+
+.import-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.import-label input {
+  display: none;
+}
+
+.builder-hint {
+  font-size: 12px;
+  color: var(--text-soft);
+  margin-bottom: 12px;
+}
+
+.builder-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.builder-empty {
+  padding: 16px;
+  background: rgba(15, 23, 42, 0.04);
+  border-radius: 12px;
+  color: var(--text-soft);
+}
+
+.builder-row {
+  display: grid;
+  grid-template-columns: 30px minmax(160px, 1.2fr) 120px minmax(280px, 2fr) 160px;
+  gap: 12px;
+  align-items: start;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: rgba(248, 250, 252, 0.6);
+}
+
+.builder-row.dragging {
+  opacity: 0.6;
+}
+
+.builder-handle {
+  background: rgba(15, 23, 42, 0.08);
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  font-size: 14px;
+  height: 40px;
+  cursor: grab;
+}
+
+.builder-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+}
+
+.builder-field label {
+  font-size: 11px;
+  color: var(--text-soft);
+  margin-bottom: 4px;
+  display: block;
+}
+
+.builder-row-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.builder-row-actions .ghost {
+  padding: 6px 10px;
+}
+
+@media (max-width: 1100px) {
+  .builder-row {
+    grid-template-columns: 30px 1fr;
+  }
+  .builder-row-actions {
+    flex-direction: row;
+  }
+}
+
 @media (max-width: 900px) {
   .wizard-actions {
     flex-direction: column;

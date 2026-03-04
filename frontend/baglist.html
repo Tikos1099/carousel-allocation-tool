@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Baglist Builder</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/app/baglist.css" />
+</head>
+<body>
+  <div class="bg-layer"></div>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">CAT</div>
+      <div class="brand-text">
+        <p class="brand-title">Baglist Builder</p>
+        <p class="brand-sub">FastAPI · Configurable Excel pipeline</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button class="ghost" id="openDocs">API Docs</button>
+      <button class="ghost" id="openMain">Allocation Wizard</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div>
+        <h1>Baglist Excel, piloté par template.</h1>
+        <p>
+          Chargez vos fichiers, définissez les colonnes (copy/const/lookup/formula),
+          et exportez un baglist.xlsx formaté, sans recoder.
+        </p>
+      </div>
+      <div class="hero-card">
+        <div>
+          <span class="pill">30k+ lignes</span>
+          <span class="pill">Vectorisé</span>
+        </div>
+        <p>Join DepFlightId / ArrFlightId, KPIs et warnings inclus.</p>
+      </div>
+    </section>
+
+    <section class="wizard">
+      <div class="stepper" id="baglistStepper">
+        <button data-step="1" class="active">1. Upload</button>
+        <button data-step="2">2. Template Builder</button>
+        <button data-step="3">3. Résultats</button>
+      </div>
+
+      <div class="step active" data-step="1">
+        <h2>Etape 1 — Fichiers d'entrée</h2>
+        <div class="grid three">
+          <div class="panel">
+            <label class="label">bags_file (obligatoire)</label>
+            <input type="file" id="bagsFile" accept=".xlsx,.csv" />
+            <p class="hint" id="bagsHint">Aucun fichier chargé.</p>
+          </div>
+          <div class="panel">
+            <label class="label">allocation_file (optionnel)</label>
+            <input type="file" id="allocationFile" accept=".xlsx,.csv" />
+            <p class="hint" id="allocationHint">Aucun fichier chargé.</p>
+          </div>
+          <div class="panel">
+            <label class="label">transfers_file (optionnel)</label>
+            <input type="file" id="transfersFile" accept=".xlsx,.csv" />
+            <p class="hint" id="transfersHint">Aucun fichier chargé.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <button class="primary" id="previewBaglistBtn">Prévisualiser</button>
+          <p class="hint" id="previewStatus">Prêt.</p>
+        </div>
+      </div>
+
+      <div class="step" data-step="2">
+        <h2>Etape 2 — Preview & Template</h2>
+        <div class="grid three">
+          <div class="panel">
+            <label class="label">Colonnes bags</label>
+            <div id="bagsColumns" class="tags"></div>
+          </div>
+          <div class="panel">
+            <label class="label">Colonnes allocation</label>
+            <div id="allocationColumns" class="tags"></div>
+          </div>
+          <div class="panel">
+            <label class="label">Colonnes transfers</label>
+            <div id="transfersColumns" class="tags"></div>
+          </div>
+        </div>
+        <div class="grid three">
+          <div class="panel">
+            <label class="label">Preview bags</label>
+            <div class="table-wrap">
+              <table id="bagsPreviewTable">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel">
+            <label class="label">Preview allocation</label>
+            <div class="table-wrap">
+              <table id="allocationPreviewTable">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel">
+            <label class="label">Preview transfers</label>
+            <div class="table-wrap">
+              <table id="transfersPreviewTable">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Template Builder</h3>
+            <div class="builder-actions">
+              <button class="ghost" id="exportProfileBtn">Exporter JSON</button>
+              <label class="ghost import-label">
+                Importer JSON
+                <input type="file" id="importProfileInput" accept=".json" />
+              </label>
+              <button class="primary" id="addColumnBtn">Ajouter colonne</button>
+            </div>
+          </div>
+          <div class="builder-hint">
+            Fonctions disponibles: `to_datetime`, `minutes`, `diff_minutes`, `concat`, `if`, `coalesce`, `to_int`, `to_str`.
+          </div>
+          <div id="templateList" class="builder-list"></div>
+        </div>
+
+        <div class="panel">
+          <button class="primary" id="runBaglistBtn">Générer le baglist</button>
+          <p class="hint" id="runBaglistStatus">En attente de config.</p>
+        </div>
+      </div>
+
+      <div class="step" data-step="3">
+        <h2>Etape 3 — Résultats</h2>
+        <section class="results" id="baglistResults">
+          <div class="grid three" id="baglistKpis"></div>
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Téléchargements</h3>
+            </div>
+            <div id="baglistDownloads" class="downloads"></div>
+          </div>
+          <div class="grid two">
+            <div class="panel">
+              <h3>Warnings (sample)</h3>
+              <div class="table-wrap">
+                <table id="baglistWarningsTable">
+                  <thead></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="panel">
+              <h3>Preview (top 50)</h3>
+              <div class="table-wrap">
+                <table id="baglistPreviewTable">
+                  <thead></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="wizard-actions">
+        <button class="ghost" id="baglistPrevBtn">Retour</button>
+        <button class="primary" id="baglistNextBtn">Suivant</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app/baglist.js"></script>
+</body>
+</html>
