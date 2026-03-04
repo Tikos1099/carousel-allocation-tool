@@ -64,6 +64,7 @@ const previewResultTable = document.getElementById("previewResultTable");
 const newRunBtn = document.getElementById("newRunBtn");
 
 const openDocs = document.getElementById("openDocs");
+const openBaglist = document.getElementById("openBaglist");
 
 function showStep(step) {
   currentStep = Math.max(1, Math.min(5, step));
@@ -86,6 +87,12 @@ nextBtn.addEventListener("click", () => showStep(currentStep + 1));
 openDocs.addEventListener("click", () => {
   window.open("/docs", "_blank");
 });
+
+if (openBaglist) {
+  openBaglist.addEventListener("click", () => {
+    window.location.href = "/baglist";
+  });
+}
 
 fileInput.addEventListener("change", (event) => {
   const file = event.target.files[0];

@@ -1,14 +1,14 @@
-﻿:root {
-  --bg: #0f172a;
-  --bg-soft: #111c34;
-  --panel: #f8f5ef;
+:root {
+  --bg: #ffffff;
+  --bg-soft: #f7f7f7;
+  --panel: #ffffff;
   --panel-strong: #ffffff;
-  --accent: #f97316;
-  --accent-2: #38bdf8;
-  --text: #101624;
-  --text-soft: #45506b;
-  --border: rgba(16, 22, 36, 0.1);
-  --shadow: 0 24px 60px rgba(15, 23, 42, 0.18);
+  --accent: #d32f2f;
+  --accent-2: #111111;
+  --text: #111111;
+  --text-soft: #6b7280;
+  --border: #e5e7eb;
+  --shadow: 0 24px 60px rgba(17, 24, 39, 0.08);
 }
 
 * {
@@ -19,15 +19,15 @@
 
 body {
   font-family: "IBM Plex Sans", sans-serif;
-  background: radial-gradient(circle at 10% 10%, #1f2a4a 0%, #101623 35%, #0b1020 100%);
-  color: #f8fafc;
+  background: var(--bg-soft);
+  color: var(--text);
   min-height: 100vh;
 }
 
 .bg-layer {
   position: fixed;
   inset: 0;
-  background: linear-gradient(140deg, rgba(249, 115, 22, 0.12), rgba(56, 189, 248, 0.08));
+  background: linear-gradient(120deg, rgba(211, 47, 47, 0.06), rgba(0, 0, 0, 0.02));
   pointer-events: none;
   z-index: -1;
 }
@@ -36,7 +36,12 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 24px 6vw 12px;
+  padding: 20px 6vw 12px;
+  background: #ffffff;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 5;
 }
 
 .brand {
@@ -53,8 +58,8 @@ body {
   place-items: center;
   font-family: "Space Grotesk", sans-serif;
   font-weight: 700;
-  background: linear-gradient(135deg, #f97316, #facc15);
-  color: #0b1020;
+  background: var(--accent);
+  color: #ffffff;
 }
 
 .brand-title {
@@ -65,13 +70,13 @@ body {
 
 .brand-sub {
   font-size: 14px;
-  color: rgba(248, 250, 252, 0.7);
+  color: var(--text-soft);
 }
 
 .top-actions .ghost {
-  border: 1px solid rgba(248, 250, 252, 0.4);
-  background: transparent;
-  color: #f8fafc;
+  border: 1px solid var(--border);
+  background: #ffffff;
+  color: var(--text);
   padding: 10px 16px;
   border-radius: 999px;
   cursor: pointer;
@@ -85,7 +90,7 @@ main {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 24px;
-  margin: 12px 0 32px;
+  margin: 24px 0 32px;
   align-items: center;
 }
 
@@ -93,27 +98,28 @@ main {
   font-family: "Space Grotesk", sans-serif;
   font-size: clamp(28px, 4vw, 44px);
   margin-bottom: 12px;
+  color: var(--text);
 }
 
 .hero p {
   font-size: 16px;
-  color: rgba(248, 250, 252, 0.8);
+  color: var(--text-soft);
 }
 
 .hero-card {
-  background: rgba(248, 250, 252, 0.08);
-  border: 1px solid rgba(248, 250, 252, 0.2);
+  background: #ffffff;
+  border: 1px solid var(--border);
   padding: 20px;
   border-radius: 20px;
-  backdrop-filter: blur(6px);
+  box-shadow: var(--shadow);
 }
 
 .pill {
   display: inline-flex;
   padding: 6px 12px;
   border-radius: 999px;
-  background: rgba(249, 115, 22, 0.2);
-  color: #fde68a;
+  background: rgba(211, 47, 47, 0.1);
+  color: var(--accent);
   font-size: 12px;
   margin-right: 8px;
 }
@@ -124,6 +130,7 @@ main {
   border-radius: 28px;
   padding: 28px;
   box-shadow: var(--shadow);
+  border: 1px solid var(--border);
 }
 
 .stepper {
@@ -135,7 +142,7 @@ main {
 
 .stepper button {
   border: 1px solid var(--border);
-  background: var(--panel-strong);
+  background: #ffffff;
   color: var(--text-soft);
   padding: 10px 16px;
   border-radius: 999px;
@@ -146,7 +153,7 @@ main {
 .stepper button.active {
   border-color: var(--accent);
   color: var(--text);
-  box-shadow: 0 10px 20px rgba(249, 115, 22, 0.2);
+  box-shadow: 0 10px 20px rgba(211, 47, 47, 0.12);
 }
 
 .step {
@@ -247,7 +254,7 @@ input[type="color"] {
 
 .primary {
   background: var(--accent);
-  color: #0b1020;
+  color: #ffffff;
   border: none;
   padding: 10px 18px;
   border-radius: 12px;
@@ -283,22 +290,12 @@ input[type="color"] {
 }
 
 .tags span {
-  background: rgba(56, 189, 248, 0.1);
-  color: #0f172a;
+  background: rgba(211, 47, 47, 0.08);
+  color: var(--text);
   padding: 6px 10px;
   border-radius: 999px;
   font-size: 12px;
-  border: 1px solid rgba(56, 189, 248, 0.4);
-}
-
-.tags.selectable span {
-  cursor: pointer;
-  border-style: dashed;
-}
-
-.tags.selectable span.active {
-  background: rgba(249, 115, 22, 0.15);
-  border-color: rgba(249, 115, 22, 0.6);
+  border: 1px solid rgba(211, 47, 47, 0.2);
 }
 
 .table-wrap {
@@ -319,7 +316,7 @@ table td {
 }
 
 table thead {
-  background: rgba(15, 23, 42, 0.05);
+  background: rgba(15, 23, 42, 0.04);
 }
 
 .stack {
@@ -379,11 +376,11 @@ table thead {
 
 .downloads a {
   text-decoration: none;
-  background: rgba(56, 189, 248, 0.15);
-  color: #0b1020;
+  background: rgba(211, 47, 47, 0.08);
+  color: var(--text);
   padding: 10px 14px;
   border-radius: 12px;
-  border: 1px solid rgba(56, 189, 248, 0.4);
+  border: 1px solid rgba(211, 47, 47, 0.2);
   font-size: 13px;
 }
 
@@ -435,7 +432,7 @@ table thead {
   padding: 12px;
   border-radius: 14px;
   border: 1px solid var(--border);
-  background: rgba(248, 250, 252, 0.6);
+  background: rgba(255, 255, 255, 0.9);
 }
 
 .builder-row.dragging {

@@ -10,6 +10,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +23,7 @@ from app_heatmap import _build_heatmap_sheets
 from app_mapping import _apply_cat_term_mapping, _guess_col
 from app_readjust import _build_extra_terms_and_defaults
 from io_excel import write_heatmap_excel, write_summary_csv, write_summary_txt, write_timeline_excel
+from baglist_expr import eval_expression as eval_baglist_expression
 
 
 class ColumnMapping(BaseModel):
@@ -142,6 +144,52 @@ class SessionRecord:
     file_meta: Dict[str, object] = field(default_factory=dict)
     updated_at: str = ""
 
+
+class BaglistJoinConfig(BaseModel):
+    left_key: Optional[str] = None
+    right_key: Optional[str] = None
+    strategy: Literal["first", "error"] = "first"
+
+    class Config:
+        extra = "ignore"
+
+
+class BaglistColumnConfig(BaseModel):
+    output_column: str
+    type: Literal["copy", "const", "lookup", "formula", "format"]
+    source: Optional[Literal["bags", "allocation", "transfers"]] = "bags"
+    field: Optional[str] = None
+    value: Optional[object] = None
+    expression: Optional[str] = None
+    join: Optional[BaglistJoinConfig] = None
+    default: Optional[object] = None
+    format: Optional[str] = None
+    cast: Optional[Literal["datetime", "date", "time", "number", "int", "text", "bool", "minutes"]] = None
+
+    class Config:
+        extra = "ignore"
+
+
+class BaglistConfig(BaseModel):
+    columns: List[BaglistColumnConfig]
+
+    class Config:
+        extra = "ignore"
+
+
+@dataclass
+class BaglistJobRecord:
+    job_id: str
+    status: Literal["queued", "running", "done", "error"]
+    created_at: str
+    finished_at: Optional[str] = None
+    kpis: Dict[str, object] = field(default_factory=dict)
+    warnings: List[Dict[str, object]] = field(default_factory=list)
+    preview_rows: List[Dict[str, object]] = field(default_factory=list)
+    downloads: Dict[str, str] = field(default_factory=dict)
+    error: Optional[str] = None
+    job_dir: Optional[Path] = None
+
 ROOT_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = ROOT_DIR / "storage"
 JOBS_DIR = STORAGE_DIR / "jobs"
@@ -163,6 +211,7 @@ app.add_middleware(
 
 JOB_STORE: Dict[str, JobRecord] = {}
 SESSION_STORE: Dict[str, SessionRecord] = {}
+BAGLIST_JOB_STORE: Dict[str, BaglistJobRecord] = {}
 
 
 def _utc_now() -> str:
@@ -513,6 +562,312 @@ def _read_carousels_file(upload: UploadFile) -> pd.DataFrame:
         return pd.read_excel(BytesIO(content), engine="openpyxl")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Unable to read carousels file: {exc}")
+
+
+def _parse_baglist_config(payload: str) -> BaglistConfig:
+    try:
+        raw = json.loads(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid config JSON: {exc}")
+    if isinstance(raw, list):
+        raw = {"columns": raw}
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="Invalid config JSON: expected object")
+    try:
+        return BaglistConfig.parse_obj(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid config JSON: {exc}")
+
+
+def _normalize_key_value(value: object) -> str:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, float):
+        if float(value).is_integer():
+            return str(int(value))
+        return str(value)
+    text = str(value).strip()
+    return text
+
+
+def _normalize_key_series(series: pd.Series) -> pd.Series:
+    return series.map(_normalize_key_value)
+
+
+_BAGLIST_FORMATS = {
+    "datetime": "dd/mm/yy hh:mm",
+    "date": "dd/mm/yy",
+    "time": "hh:mm",
+    "number": "0.00",
+    "int": "0",
+    "minutes": "0",
+    "text": "@",
+    "bool": "0",
+    "boolean": "0",
+}
+
+
+def _coerce_series(series: pd.Series, cast: str) -> pd.Series:
+    cast_key = cast.lower()
+    if cast_key in ("datetime", "date", "time"):
+        dt = pd.to_datetime(series, errors="coerce")
+        if cast_key == "date":
+            return dt.dt.normalize()
+        return dt
+    if cast_key in ("number", "numeric", "float"):
+        return pd.to_numeric(series, errors="coerce")
+    if cast_key in ("int", "integer"):
+        return pd.to_numeric(series, errors="coerce")
+    if cast_key in ("text", "string"):
+        return series.fillna("").astype(str)
+    if cast_key in ("bool", "boolean"):
+        return series.fillna(False).astype(bool)
+    if cast_key == "minutes":
+        dt = pd.to_datetime(series, errors="coerce")
+        return dt.dt.hour * 60 + dt.dt.minute + dt.dt.second / 60
+    return series
+
+
+def _apply_cast_and_format(
+    series: pd.Series,
+    cast: Optional[str],
+    fmt: Optional[str],
+) -> tuple[pd.Series, Optional[str]]:
+    excel_format = None
+    fmt_key = None
+    if fmt:
+        fmt_key = fmt.strip().lower()
+        if fmt_key in _BAGLIST_FORMATS:
+            excel_format = _BAGLIST_FORMATS[fmt_key]
+            if not cast:
+                cast = fmt_key
+        else:
+            excel_format = fmt
+    if cast:
+        series = _coerce_series(series, cast)
+    return series, excel_format
+
+
+def _prepare_lookup_index(
+    source_name: str,
+    source_df: Optional[pd.DataFrame],
+    right_key: str,
+    strategy: str,
+) -> tuple[Optional[pd.DataFrame], int, List[str]]:
+    if source_df is None:
+        return None, 0, []
+    if right_key not in source_df.columns:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing right_key '{right_key}' in {source_name} file.",
+        )
+    right_norm = _normalize_key_series(source_df[right_key])
+    valid_mask = right_norm != ""
+    dup_mask = right_norm[valid_mask].duplicated(keep=False)
+    dup_keys = sorted(set(right_norm[valid_mask][dup_mask].tolist()))
+    dup_count = len(dup_keys)
+    if dup_count and strategy == "error":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Duplicate keys in {source_name} for '{right_key}': {dup_count}",
+        )
+    dedup = source_df.loc[valid_mask].copy()
+    dedup["_baglist_key"] = right_norm[valid_mask].values
+    dedup = dedup.drop_duplicates(subset=["_baglist_key"], keep="first").set_index("_baglist_key")
+    return dedup, dup_count, dup_keys
+
+
+def _apply_baglist_template(
+    bags_df: pd.DataFrame,
+    allocation_df: Optional[pd.DataFrame],
+    transfers_df: Optional[pd.DataFrame],
+    cfg: BaglistConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, object], Dict[str, Optional[str]]]:
+    warnings_frames: List[pd.DataFrame] = []
+    column_formats: Dict[str, Optional[str]] = {}
+    output_df = pd.DataFrame(index=bags_df.index)
+    work_df = bags_df.copy()
+
+    lookup_cache: Dict[tuple[str, str, str], tuple[Optional[pd.DataFrame], int, List[str]]] = {}
+    join_cache: Dict[tuple[str, str, str], tuple[pd.Series, pd.Series, pd.Series]] = {}
+
+    missing_counts = {"allocation": 0, "transfers": 0}
+    not_found_counts = {"allocation": 0, "transfers": 0}
+    duplicates_counts = {"allocation": 0, "transfers": 0}
+    counted_joins: set[tuple[str, str, str]] = set()
+
+    def _get_source_df(source: str) -> Optional[pd.DataFrame]:
+        if source == "allocation":
+            return allocation_df
+        if source == "transfers":
+            return transfers_df
+        return None
+
+    for col in cfg.columns:
+        output_name = col.output_column
+        if not output_name:
+            continue
+
+        if col.type == "copy":
+            source_field = col.field or output_name
+            if source_field not in work_df.columns:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown field '{source_field}' for copy column '{output_name}'.",
+                )
+            series = work_df[source_field]
+
+        elif col.type == "const":
+            series = pd.Series([col.value] * len(work_df), index=work_df.index)
+
+        elif col.type == "lookup":
+            source = col.source or "allocation"
+            if source not in ("allocation", "transfers"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported lookup source '{source}' for '{output_name}'.",
+                )
+            join_cfg = col.join or BaglistJoinConfig()
+            left_key = join_cfg.left_key or ("DepFlightId" if source == "allocation" else "ArrFlightId")
+            right_key = join_cfg.right_key or left_key
+            if left_key not in work_df.columns:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing left_key '{left_key}' in bags file for '{output_name}'.",
+                )
+            strategy = join_cfg.strategy or "first"
+            lookup_key = (source, right_key, strategy)
+            if lookup_key not in lookup_cache:
+                lookup_cache[lookup_key] = _prepare_lookup_index(
+                    source,
+                    _get_source_df(source),
+                    right_key,
+                    strategy,
+                )
+            right_index, dup_count, dup_keys = lookup_cache[lookup_key]
+            if dup_count:
+                duplicates_counts[source] = max(duplicates_counts[source], dup_count)
+                warnings_frames.append(pd.DataFrame({
+                    "warning_type": "duplicate_key",
+                    "source": source,
+                    "output_column": output_name,
+                    "left_key": right_key,
+                    "left_value": dup_keys,
+                    "row_index": [""] * len(dup_keys),
+                }))
+
+            if col.field is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing field for lookup column '{output_name}'.",
+                )
+            if right_index is not None and col.field not in right_index.columns:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Field '{col.field}' not found in {source} file for '{output_name}'.",
+                )
+
+            join_key = (source, left_key, right_key)
+            if join_key in join_cache:
+                left_norm, missing_mask, not_found_mask = join_cache[join_key]
+            else:
+                left_norm = _normalize_key_series(work_df[left_key])
+                missing_mask = left_norm == ""
+                if right_index is None:
+                    not_found_mask = ~missing_mask
+                else:
+                    not_found_mask = ~missing_mask & ~left_norm.isin(right_index.index)
+                join_cache[join_key] = (left_norm, missing_mask, not_found_mask)
+                if join_key not in counted_joins:
+                    missing_counts[source] += int(missing_mask.sum())
+                    not_found_counts[source] += int(not_found_mask.sum())
+                    counted_joins.add(join_key)
+
+            default_value = col.default if col.default is not None else ""
+            if right_index is None:
+                series = pd.Series([default_value] * len(work_df), index=work_df.index)
+            else:
+                series = left_norm.map(right_index[col.field])
+                series = series.where(~(missing_mask | not_found_mask), default_value)
+
+            if missing_mask.any():
+                warnings_frames.append(pd.DataFrame({
+                    "warning_type": "missing_key",
+                    "source": source,
+                    "output_column": output_name,
+                    "left_key": left_key,
+                    "left_value": left_norm[missing_mask].values,
+                    "row_index": work_df.index[missing_mask].astype(str).values,
+                }))
+            if not_found_mask.any():
+                warnings_frames.append(pd.DataFrame({
+                    "warning_type": "not_found",
+                    "source": source,
+                    "output_column": output_name,
+                    "left_key": left_key,
+                    "left_value": left_norm[not_found_mask].values,
+                    "row_index": work_df.index[not_found_mask].astype(str).values,
+                }))
+
+        elif col.type == "formula":
+            if not col.expression:
+                raise HTTPException(status_code=400, detail=f"Missing expression for '{output_name}'.")
+            try:
+                series = eval_baglist_expression(col.expression, work_df)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Formula error for '{output_name}': {exc}")
+
+        elif col.type == "format":
+            source_field = col.field or output_name
+            if source_field not in work_df.columns:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown field '{source_field}' for format column '{output_name}'.",
+                )
+            series = work_df[source_field]
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported column type '{col.type}'.")
+
+        series = pd.Series(series, index=work_df.index)
+        series, excel_format = _apply_cast_and_format(series, col.cast, col.format)
+        output_df[output_name] = series
+        work_df[output_name] = series
+        if excel_format:
+            column_formats[output_name] = excel_format
+
+    warnings_df = pd.concat(warnings_frames, ignore_index=True) if warnings_frames else pd.DataFrame(
+        columns=["warning_type", "source", "output_column", "left_key", "left_value", "row_index"]
+    )
+
+    kpis = {
+        "rows_in": int(len(bags_df)),
+        "rows_out": int(len(output_df)),
+        "warnings_count": int(len(warnings_df)),
+        "missing_depflightid": int(missing_counts["allocation"]),
+        "missing_arrflightid": int(missing_counts["transfers"]),
+        "allocation_not_found": int(not_found_counts["allocation"]),
+        "transfers_not_found": int(not_found_counts["transfers"]),
+        "allocation_duplicates": int(duplicates_counts["allocation"]),
+        "transfers_duplicates": int(duplicates_counts["transfers"]),
+    }
+
+    return output_df, warnings_df, kpis, column_formats
+
+
+def _write_baglist_excel(path: Path, df: pd.DataFrame, column_formats: Dict[str, Optional[str]]) -> None:
+    with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="baglist")
+        workbook = writer.book
+        worksheet = writer.sheets["baglist"]
+        for idx, col_name in enumerate(df.columns):
+            fmt = column_formats.get(col_name)
+            if not fmt:
+                continue
+            fmt_obj = workbook.add_format({"num_format": fmt})
+            worksheet.set_column(idx, idx, None, fmt_obj)
 
 
 def _apply_column_mapping(df: pd.DataFrame, mapping: ColumnMapping) -> tuple[pd.DataFrame, List[str]]:
@@ -1512,6 +1867,136 @@ def preview_result(job_id: str, filename: str, limit: int = 20):
         "columns": df.columns.tolist(),
         "rows": df.fillna("").to_dict(orient="records"),
     }
+
+
+@app.post("/api/baglist/preview")
+def baglist_preview(
+    bags_file: UploadFile = File(...),
+    allocation_file: Optional[UploadFile] = File(None),
+    transfers_file: Optional[UploadFile] = File(None),
+):
+    bags_df = _read_excel(bags_file, nrows=10)
+    allocation_df = _read_excel(allocation_file, nrows=10) if allocation_file else None
+    transfers_df = _read_excel(transfers_file, nrows=10) if transfers_file else None
+
+    return {
+        "bags": {
+            "columns": bags_df.columns.tolist(),
+            "preview": bags_df.fillna("").head(10).to_dict(orient="records"),
+        },
+        "allocation": {
+            "columns": allocation_df.columns.tolist() if allocation_df is not None else [],
+            "preview": allocation_df.fillna("").head(10).to_dict(orient="records") if allocation_df is not None else [],
+        },
+        "transfers": {
+            "columns": transfers_df.columns.tolist() if transfers_df is not None else [],
+            "preview": transfers_df.fillna("").head(10).to_dict(orient="records") if transfers_df is not None else [],
+        },
+    }
+
+
+@app.post("/api/baglist/run")
+def baglist_run(
+    bags_file: UploadFile = File(...),
+    allocation_file: Optional[UploadFile] = File(None),
+    transfers_file: Optional[UploadFile] = File(None),
+    config_json: Optional[str] = Form(None),
+):
+    if not config_json:
+        raise HTTPException(status_code=400, detail="Missing config_json")
+    cfg = _parse_baglist_config(config_json)
+
+    job_id = str(uuid.uuid4())
+    job_dir = JOBS_DIR / job_id / "baglist"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    record = BaglistJobRecord(job_id=job_id, status="running", created_at=_utc_now(), job_dir=job_dir)
+    BAGLIST_JOB_STORE[job_id] = record
+
+    try:
+        bags_df = _read_excel(bags_file)
+        allocation_df = _read_excel(allocation_file) if allocation_file else None
+        transfers_df = _read_excel(transfers_file) if transfers_file else None
+
+        output_df, warnings_df, kpis, column_formats = _apply_baglist_template(
+            bags_df,
+            allocation_df,
+            transfers_df,
+            cfg,
+        )
+
+        baglist_path = job_dir / "baglist.xlsx"
+        warnings_path = job_dir / "baglist_warnings.csv"
+        _write_baglist_excel(baglist_path, output_df, column_formats)
+        warnings_df.to_csv(warnings_path, index=False, encoding="utf-8")
+
+        preview_rows = _df_to_records(output_df, limit=50)
+        warnings_sample = warnings_df.head(50).fillna("").to_dict(orient="records")
+
+        record.status = "done"
+        record.finished_at = _utc_now()
+        record.kpis = kpis
+        record.preview_rows = preview_rows
+        record.warnings = warnings_sample
+        record.downloads = {
+            "baglist_xlsx": f"/api/baglist/jobs/{job_id}/download/{baglist_path.name}",
+            "warnings_csv": f"/api/baglist/jobs/{job_id}/download/{warnings_path.name}",
+        }
+
+        return {
+            "job_id": job_id,
+            "kpis": kpis,
+            "warnings_sample": warnings_sample,
+            "preview_rows": preview_rows,
+            "downloads": record.downloads,
+        }
+    except HTTPException:
+        record.status = "error"
+        record.finished_at = _utc_now()
+        raise
+    except Exception as exc:
+        record.status = "error"
+        record.finished_at = _utc_now()
+        record.error = str(exc)
+        raise HTTPException(status_code=500, detail=f"Baglist generation failed: {exc}")
+
+
+@app.get("/api/baglist/jobs/{job_id}")
+def baglist_get_job(job_id: str):
+    record = BAGLIST_JOB_STORE.get(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "job_id": record.job_id,
+        "status": record.status,
+        "created_at": record.created_at,
+        "finished_at": record.finished_at,
+        "kpis": record.kpis,
+        "warnings_sample": record.warnings,
+        "preview_rows": record.preview_rows,
+        "downloads": record.downloads,
+        "error": record.error,
+    }
+
+
+@app.get("/api/baglist/jobs/{job_id}/download/{filename}")
+def baglist_download(job_id: str, filename: str):
+    record = BAGLIST_JOB_STORE.get(job_id)
+    if not record or not record.job_dir:
+        raise HTTPException(status_code=404, detail="Job not found")
+    safe_name = Path(filename).name
+    file_path = record.job_dir / safe_name
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path=file_path, filename=safe_name)
+
+
+@app.get("/baglist")
+@app.get("/baglist/results/{job_id}")
+def baglist_page(job_id: Optional[str] = None):
+    baglist_path = FRONTEND_DIR / "baglist.html"
+    if not baglist_path.exists():
+        raise HTTPException(status_code=404, detail="Baglist frontend not found")
+    return FileResponse(baglist_path)
 
 
 if FRONTEND_DIR.exists():
