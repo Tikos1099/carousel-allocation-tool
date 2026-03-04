@@ -1,0 +1,298 @@
+﻿<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Carousel Allocation Tool</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="bg-layer"></div>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">CAT</div>
+      <div class="brand-text">
+        <p class="brand-title">Carousel Allocation Tool</p>
+        <p class="brand-sub">Backend FastAPI · Front HTML/JS</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button class="ghost" id="openDocs">API Docs</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div>
+        <h1>Allocation des carrousels, version web.</h1>
+        <p>
+          Wizard guidé, KPIs instantanés, exports Excel identiques.
+          Le code d'allocation reste 100% Python côté serveur.
+        </p>
+      </div>
+      <div class="hero-card">
+        <div>
+          <span class="pill">Sécurisé</span>
+          <span class="pill">Scalable</span>
+        </div>
+        <p>Upload ? Mapping ? Règles ? Run ? Résultats.</p>
+      </div>
+    </section>
+
+    <section class="wizard">
+      <div class="stepper" id="stepper">
+        <button data-step="1" class="active">1. Upload</button>
+        <button data-step="2">2. Mapping colonnes</button>
+        <button data-step="3">3. Catégories / Terminaux</button>
+        <button data-step="4">4. Carrousels</button>
+        <button data-step="5">5. Règles & Run</button>
+      </div>
+
+      <div class="step" data-step="1">
+        <h2>Etape 1 — Upload fichier vols</h2>
+        <div class="grid two">
+          <div class="panel">
+            <label class="label">Fichier Excel</label>
+            <input type="file" id="fileInput" accept=".xlsx" />
+            <button class="primary" id="previewBtn">Prévisualiser</button>
+            <p class="hint" id="fileHint">Aucun fichier chargé.</p>
+          </div>
+          <div class="panel">
+            <label class="label">Colonnes détectées</label>
+            <div id="columnsList" class="tags"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <label class="label">Aperçu des données</label>
+          <div class="table-wrap">
+            <table id="previewTable">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="step" data-step="2">
+        <h2>Etape 2 — Mapping colonnes</h2>
+        <div class="grid three">
+          <div class="panel">
+            <label class="label">DepartureTime</label>
+            <select id="mapDeparture"></select>
+          </div>
+          <div class="panel">
+            <label class="label">FlightNumber</label>
+            <select id="mapFlight"></select>
+          </div>
+          <div class="panel">
+            <label class="label">Category</label>
+            <select id="mapCategory"></select>
+          </div>
+          <div class="panel">
+            <label class="label">Positions</label>
+            <select id="mapPositions"></select>
+          </div>
+          <div class="panel">
+            <label class="label">Terminal (optionnel)</label>
+            <select id="mapTerminal"></select>
+          </div>
+          <div class="panel">
+            <label class="label">MakeupOpening (optionnel)</label>
+            <select id="mapOpening"></select>
+          </div>
+          <div class="panel">
+            <label class="label">MakeupClosing (optionnel)</label>
+            <select id="mapClosing"></select>
+          </div>
+          <div class="panel span-2">
+            <label class="label">Colonnes supplémentaires à conserver</label>
+            <div id="extraCols" class="tags selectable"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <label class="label">Make-up times</label>
+          <div class="toggle">
+            <label><input type="radio" name="makeupMode" value="columns" checked /> Utiliser colonnes Makeup</label>
+            <label><input type="radio" name="makeupMode" value="compute" /> Calculer depuis DepartureTime</label>
+          </div>
+          <div class="grid four" id="makeupInputs">
+            <div>
+              <label>Wide open (min)</label>
+              <input type="number" id="wideOpen" value="120" />
+            </div>
+            <div>
+              <label>Wide close (min)</label>
+              <input type="number" id="wideClose" value="60" />
+            </div>
+            <div>
+              <label>Narrow open (min)</label>
+              <input type="number" id="narrowOpen" value="90" />
+            </div>
+            <div>
+              <label>Narrow close (min)</label>
+              <input type="number" id="narrowClose" value="45" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="step" data-step="3">
+        <h2>Etape 3 — Mapping catégories & terminaux</h2>
+        <div class="grid two">
+          <div class="panel">
+            <label class="label">Catégories détectées</label>
+            <div id="categoryMapping"></div>
+          </div>
+          <div class="panel">
+            <label class="label">Terminaux détectés</label>
+            <div id="terminalMapping"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <button class="primary" id="inspectBtn">Analyser les valeurs</button>
+          <p class="hint">L'analyse utilise le fichier uploadé + le mapping colonnes.</p>
+        </div>
+      </div>
+
+      <div class="step" data-step="4">
+        <h2>Etape 4 — Carrousels & Time step</h2>
+        <div class="grid three">
+          <div class="panel">
+            <label class="label">Time step (minutes)</label>
+            <input type="number" id="timeStep" value="5" min="1" />
+          </div>
+          <div class="panel">
+            <label class="label">Mode carrousels</label>
+            <div class="toggle">
+              <label><input type="radio" name="carouselsMode" value="manual" checked /> Manuel</label>
+              <label><input type="radio" name="carouselsMode" value="file" /> Par terminal</label>
+            </div>
+          </div>
+        </div>
+        <div class="panel" id="manualCarousels">
+          <div class="panel-header">
+            <h3>Carrousels manuels</h3>
+            <button class="ghost" id="addCarousel">Ajouter</button>
+          </div>
+          <div id="carouselList" class="stack"></div>
+        </div>
+        <div class="panel hidden" id="terminalCarousels">
+          <div class="panel-header">
+            <h3>Carrousels par terminal</h3>
+            <button class="ghost" id="addTerminalCarousel">Ajouter</button>
+          </div>
+          <div id="terminalCarouselList" class="stack"></div>
+        </div>
+      </div>
+
+      <div class="step" data-step="5">
+        <h2>Etape 5 — Règles, extras, exécution</h2>
+        <div class="grid three">
+          <div class="panel">
+            <label class="label">Readjustement</label>
+            <label class="checkbox"><input type="checkbox" id="applyReadjustment" checked /> Appliquer</label>
+            <label class="checkbox"><input type="checkbox" id="ruleMulti" checked /> Règle multi-carrousels</label>
+            <label class="checkbox"><input type="checkbox" id="ruleNarrowWide" /> Règle Narrow -> Wide</label>
+            <label class="checkbox"><input type="checkbox" id="ruleExtras" checked /> Règle Extras</label>
+          </div>
+          <div class="panel">
+            <label class="label">Limites split</label>
+            <label>Max carrousels Narrow</label>
+            <input type="number" id="maxCarouselsNarrow" value="3" min="1" />
+            <label>Max carrousels Wide</label>
+            <input type="number" id="maxCarouselsWide" value="2" min="1" />
+          </div>
+          <div class="panel">
+            <label class="label">Extras (capacité par défaut)</label>
+            <label>Wide capacity</label>
+            <input type="number" id="extraWide" value="8" min="0" />
+            <label>Narrow capacity</label>
+            <input type="number" id="extraNarrow" value="4" min="0" />
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Couleurs planning</h3>
+          </div>
+          <div class="grid four">
+            <div>
+              <label>Wide</label>
+              <input type="color" id="wideColor" value="#D32F2F" />
+            </div>
+            <div>
+              <label>Narrow</label>
+              <input type="color" id="narrowColor" value="#FFEBEE" />
+            </div>
+            <div>
+              <label>Split</label>
+              <input type="color" id="splitColor" value="#FFC107" />
+            </div>
+            <div>
+              <label>Narrow -> Wide</label>
+              <input type="color" id="narrowWideColor" value="#00B894" />
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <button class="primary" id="runBtn">Lancer l'allocation</button>
+          <p class="hint" id="runStatus">Prêt.</p>
+        </div>
+      </div>
+
+      <div class="wizard-actions">
+        <button class="ghost" id="prevBtn">Retour</button>
+        <button class="primary" id="nextBtn">Suivant</button>
+      </div>
+    </section>
+
+    <section class="results hidden" id="resultsSection">
+      <div class="panel-header">
+        <h2>Résultats</h2>
+        <button class="ghost" id="newRunBtn">Nouveau run</button>
+      </div>
+      <div class="grid three" id="kpiGrid"></div>
+      <div class="grid two">
+        <div class="panel">
+          <canvas id="assignedChart"></canvas>
+        </div>
+        <div class="panel">
+          <canvas id="rulesChart"></canvas>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">
+          <h3>Téléchargements</h3>
+        </div>
+        <div id="downloads" class="downloads"></div>
+      </div>
+      <div class="grid two">
+        <div class="panel">
+          <h3>Warnings</h3>
+          <div class="table-wrap">
+            <table id="warningsTable">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>Preview (summary_readjusted.csv)</h3>
+          <div class="table-wrap">
+            <table id="previewResultTable">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
