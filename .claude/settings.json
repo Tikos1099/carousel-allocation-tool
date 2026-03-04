@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm --version)",
+      "Bash(npm install)",
+      "Bash(npm audit)",
+      "Bash(npm install next@16.1.6)",
+      "Bash(npm install next@16.1.6 --legacy-peer-deps)"
+    ]
+  }
+}
