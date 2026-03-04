@@ -6,3 +6,4 @@ numpy
 openpyxl
 xlsxwriter
 python-dateutil
+streamlit
