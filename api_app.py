@@ -205,10 +205,12 @@ ALLOWED_ORIGINS = [
     "https://carousel-allocation-tool.vercel.app",
     "http://localhost:3000",
 ]
+ALLOWED_ORIGIN_REGEX = r"https://.*\.vercel\.app"
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -104,7 +104,15 @@ const devFallbackBase =
   (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
     ? "http://127.0.0.1:8000"
     : ""
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || devFallbackBase).replace(/\/$/, "")
+const prodFallbackBase =
+  typeof window !== "undefined" && window.location.hostname.endsWith(".vercel.app")
+    ? "https://carousel-allocation-tool-production.up.railway.app"
+    : ""
+const API_BASE = (
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  devFallbackBase ||
+  prodFallbackBase
+).replace(/\/$/, "")
 
 const SESSION_KEY = "makeup_session_id"
 let sessionIdCache: string | null = null
