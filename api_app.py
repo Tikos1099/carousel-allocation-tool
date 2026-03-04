@@ -202,7 +202,7 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="Carousel Allocation API", version="1.0")
 
 ALLOWED_ORIGINS = [
-    "https://carousel-allocati-git-358c31-atik-sidi-ahmeds-projects-213b7715.vercel.app",
+    "https://carousel-allocation-tool.vercel.app",
     "http://localhost:3000",
 ]
 
