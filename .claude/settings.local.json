@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls c:/Users/ASA/Desktop/perso/projects/carousel-allocation-tool/*.py)",
+      "Bash(ls c:/Users/ASA/Desktop/perso/projects/carousel-allocation-tool/*.docx)",
+      "Bash(pip show playwright)",
+      "WebFetch(domain:www.mieuxvivreputeaux.fr)",
+      "Bash(pip install playwright)",
+      "Bash(python -m playwright install chromium)",
+      "Bash(python gen_pdf_test.py)",
+      "Bash(npx tsc:*)",
+      "Bash(node -e \":*)"
+    ]
+  }
+}

@@ -2,5 +2,9 @@
   "framework": "nextjs",
   "buildCommand": "next build",
   "outputDirectory": ".next",
-  "installCommand": "npm install"
+  "installCommand": "npm install",
+  "env": {
+    "NEXT_PUBLIC_SUPABASE_URL": "https://efamhzjngkzwoyvypaur.supabase.co",
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVmYW1oempuZ2t6d295dnlwYXVyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ2MDA1NDAsImV4cCI6MjA5MDE3NjU0MH0.rc8yPAdQJ7TKkjhRo3F6ovmijLjuJOpxMyS3fvE5r5s"
+  }
 }

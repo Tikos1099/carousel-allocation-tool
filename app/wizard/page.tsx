@@ -216,7 +216,11 @@ export default function WizardPage() {
         extrasByTerminal: state.extrasByTerminal,
       }
 
-      const { jobId } = await runJob(state.file, config)
+      const scenarioName =
+        typeof window !== "undefined"
+          ? (window.sessionStorage.getItem("carousel_scenario_name") ?? undefined)
+          : undefined
+      const { jobId } = await runJob(state.file, config, scenarioName)
       
       toast.success("Allocation terminee avec succes!", { duration: 3000 })
       

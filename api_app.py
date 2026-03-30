@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import uuid
+
+from dotenv import load_dotenv
+load_dotenv(".env.local")   # charge les variables locales pour le backend Python
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
@@ -125,6 +129,8 @@ class JobRecord:
     status: Literal["queued", "running", "done", "error"]
     created_at: str
     finished_at: Optional[str] = None
+    scenario_name: Optional[str] = None
+    storage_size_bytes: int = 0
     kpis: Dict[str, object] = field(default_factory=dict)
     analytics: Dict[str, object] = field(default_factory=dict)
     warnings: List[Dict[str, object]] = field(default_factory=list)
@@ -190,14 +196,62 @@ class BaglistJobRecord:
     error: Optional[str] = None
     job_dir: Optional[Path] = None
 
+
+@dataclass
+class CustomKPI:
+    kpi_id: str
+    name: str
+    metric: str          # e.g. "assigned_pct", "unassigned_count", …
+    display_type: str    # "percentage" | "counter" | "text"
+    description: str = ""
+    alert_enabled: bool = False
+    alert_operator: str = "lt"   # "lt" | "gt"
+    alert_threshold: float = 0.0
+    created_at: str = ""
+
+
+class CustomKPIPayload(BaseModel):
+    name: str
+    metric: str
+    display_type: str
+    description: str = ""
+    alert_enabled: bool = False
+    alert_operator: str = "lt"
+    alert_threshold: float = 0.0
+
+    class Config:
+        extra = "ignore"
+
+
 ROOT_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = ROOT_DIR / "storage"
 JOBS_DIR = STORAGE_DIR / "jobs"
 SESSIONS_DIR = STORAGE_DIR / "sessions"
 FRONTEND_DIR = ROOT_DIR / "frontend"
+CUSTOM_KPI_FILE = STORAGE_DIR / "custom_kpis.json"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Supabase client ────────────────────────────────────────────────────────
+_supabase_client = None
+
+def _get_supabase():
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+    url = (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL", "")).strip()
+    # Priorité : service_role key → anon key (RLS désactivé = anon key suffit)
+    key = os.getenv("SUPABASE_KEY", "").strip()
+    if not key or key.startswith("<"):
+        key = os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY", "").strip()
+    if url and key:
+        try:
+            from supabase import create_client
+            _supabase_client = create_client(url, key)
+        except Exception:
+            pass
+    return _supabase_client
 
 app = FastAPI(title="Carousel Allocation API", version="1.0")
 
@@ -219,10 +273,233 @@ app.add_middleware(
 JOB_STORE: Dict[str, JobRecord] = {}
 SESSION_STORE: Dict[str, SessionRecord] = {}
 BAGLIST_JOB_STORE: Dict[str, BaglistJobRecord] = {}
+CUSTOM_KPI_STORE: Dict[str, CustomKPI] = {}
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Disk persistence helpers ────────────────────────────────────────────────
+
+def _job_to_dict(record: JobRecord) -> dict:
+    return {
+        "job_id": record.job_id,
+        "scenario_name": record.scenario_name,
+        "status": record.status,
+        "created_at": record.created_at,
+        "finished_at": record.finished_at,
+        "storage_size_bytes": record.storage_size_bytes,
+        "kpis": record.kpis,
+        "analytics": record.analytics,
+        "warnings": record.warnings,
+        "downloads": record.downloads,
+        "tables": record.tables,
+        "error": record.error,
+    }
+
+
+def _compute_job_storage_size(job_dir: Optional[Path]) -> int:
+    if not job_dir or not job_dir.exists():
+        return 0
+    return sum(f.stat().st_size for f in job_dir.iterdir() if f.is_file())
+
+
+def _save_job_to_supabase(record: JobRecord) -> None:
+    sb = _get_supabase()
+    if not sb:
+        return
+    try:
+        size = _compute_job_storage_size(record.job_dir)
+        record.storage_size_bytes = size
+        sb.table("jobs").upsert({
+            "job_id": record.job_id,
+            "scenario_name": record.scenario_name,
+            "status": record.status,
+            "created_at": record.created_at,
+            "finished_at": record.finished_at,
+            "kpis": record.kpis,
+            "analytics": record.analytics,
+            "warnings": record.warnings,
+            "downloads": record.downloads,
+            "tables_data": record.tables,
+            "error": record.error,
+            "storage_size_bytes": size,
+        }).execute()
+    except Exception:
+        pass
+
+
+def _load_jobs_from_supabase() -> None:
+    sb = _get_supabase()
+    if not sb:
+        return
+    try:
+        response = sb.table("jobs").select("*").execute()
+        for row in response.data:
+            job_id = row["job_id"]
+            job_dir = JOBS_DIR / job_id
+            record = JobRecord(
+                job_id=job_id,
+                scenario_name=row.get("scenario_name"),
+                status=row.get("status", "done"),
+                created_at=row.get("created_at", ""),
+                finished_at=row.get("finished_at"),
+                kpis=row.get("kpis") or {},
+                analytics=row.get("analytics") or {},
+                warnings=row.get("warnings") or [],
+                downloads=row.get("downloads") or {},
+                tables=row.get("tables_data") or {},
+                error=row.get("error"),
+                storage_size_bytes=row.get("storage_size_bytes") or 0,
+                job_dir=job_dir if job_dir.exists() else None,
+            )
+            JOB_STORE[record.job_id] = record
+    except Exception:
+        pass
+
+
+def _save_job_to_disk(record: JobRecord) -> None:
+    if not record.job_dir:
+        return
+    try:
+        meta_path = record.job_dir / "job.json"
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(_job_to_dict(record), fh, ensure_ascii=False, default=str)
+    except Exception:
+        pass
+    _save_job_to_supabase(record)
+
+
+def _load_jobs_from_disk() -> None:
+    for job_dir in sorted(JOBS_DIR.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        meta_path = job_dir / "job.json"
+        if not meta_path.exists():
+            continue
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            record = JobRecord(
+                job_id=data["job_id"],
+                scenario_name=data.get("scenario_name"),
+                status=data.get("status", "done"),
+                created_at=data.get("created_at", ""),
+                finished_at=data.get("finished_at"),
+                storage_size_bytes=data.get("storage_size_bytes", 0),
+                kpis=data.get("kpis", {}),
+                analytics=data.get("analytics", {}),
+                warnings=data.get("warnings", []),
+                downloads=data.get("downloads", {}),
+                tables=data.get("tables", {}),
+                error=data.get("error"),
+                job_dir=job_dir,
+            )
+            JOB_STORE[record.job_id] = record
+        except Exception:
+            pass
+
+
+def _save_session_to_disk(record: SessionRecord) -> None:
+    try:
+        session_path = SESSIONS_DIR / f"{record.session_id}.json"
+        data = {
+            "session_id": record.session_id,
+            "wizard_state": record.wizard_state,
+            "current_step": record.current_step,
+            "last_job_id": record.last_job_id,
+            "file_meta": record.file_meta,
+            "updated_at": record.updated_at,
+        }
+        with open(session_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, default=str)
+    except Exception:
+        pass
+
+
+def _load_sessions_from_disk() -> None:
+    for session_file in SESSIONS_DIR.glob("*.json"):
+        try:
+            with open(session_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            record = SessionRecord(
+                session_id=data["session_id"],
+                wizard_state=data.get("wizard_state", {}),
+                current_step=data.get("current_step", 1),
+                last_job_id=data.get("last_job_id"),
+                file_meta=data.get("file_meta", {}),
+                updated_at=data.get("updated_at", ""),
+            )
+            SESSION_STORE[record.session_id] = record
+        except Exception:
+            pass
+
+
+def _save_custom_kpis_to_disk() -> None:
+    try:
+        data = [
+            {
+                "kpi_id": k.kpi_id,
+                "name": k.name,
+                "metric": k.metric,
+                "display_type": k.display_type,
+                "description": k.description,
+                "alert_enabled": k.alert_enabled,
+                "alert_operator": k.alert_operator,
+                "alert_threshold": k.alert_threshold,
+                "created_at": k.created_at,
+            }
+            for k in CUSTOM_KPI_STORE.values()
+        ]
+        with open(CUSTOM_KPI_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _load_custom_kpis_from_disk() -> None:
+    if not CUSTOM_KPI_FILE.exists():
+        return
+    try:
+        with open(CUSTOM_KPI_FILE, "r", encoding="utf-8") as fh:
+            items = json.load(fh)
+        for item in items:
+            kpi = CustomKPI(
+                kpi_id=item["kpi_id"],
+                name=item["name"],
+                metric=item["metric"],
+                display_type=item.get("display_type", "counter"),
+                description=item.get("description", ""),
+                alert_enabled=item.get("alert_enabled", False),
+                alert_operator=item.get("alert_operator", "lt"),
+                alert_threshold=float(item.get("alert_threshold", 0.0)),
+                created_at=item.get("created_at", ""),
+            )
+            CUSTOM_KPI_STORE[kpi.kpi_id] = kpi
+    except Exception:
+        pass
+
+
+def _migrate_jobs_to_supabase() -> None:
+    """Push all jobs loaded from disk into Supabase (runs once on startup)."""
+    sb = _get_supabase()
+    if not sb:
+        return
+    try:
+        existing = {row["job_id"] for row in sb.table("jobs").select("job_id").execute().data}
+        for record in list(JOB_STORE.values()):
+            if record.job_id not in existing and record.status == "done":
+                _save_job_to_supabase(record)
+    except Exception:
+        pass
+
+
+_load_jobs_from_disk()
+_migrate_jobs_to_supabase()       # pousse les jobs du disque vers Supabase si absents
+_load_jobs_from_supabase()        # Supabase override (a scenario_name, storage_size_bytes)
+_load_sessions_from_disk()
+_load_custom_kpis_from_disk()
 
 
 def _get_session_id(request: Request) -> str:
@@ -1407,10 +1684,27 @@ def _compute_analytics(flights_readjusted: pd.DataFrame) -> Dict[str, object]:
             for hour, count in hour_counts.items()
         ]
 
+    # Carousel breakdown
+    carousel_col = df.get("AssignedCarousel", pd.Series([], dtype=object)).fillna("").astype(str)
+    term_col = df.get("Terminal", pd.Series([], dtype=object)).fillna("").astype(str).str.strip().replace("", "Unknown")
+    assigned_mask = carousel_col.str.upper() != "UNASSIGNED"
+    if assigned_mask.any():
+        grp = df[assigned_mask].copy()
+        grp["_term"] = term_col[assigned_mask].values
+        grp["_carousel"] = carousel_col[assigned_mask].values
+        counts = grp.groupby(["_term", "_carousel"]).size().reset_index(name="count")
+        carousel_breakdown: List[Dict[str, object]] = [
+            {"carousel": str(r["_carousel"]), "terminal": str(r["_term"]), "count": int(r["count"])}
+            for _, r in counts.sort_values("count", ascending=False).iterrows()
+        ]
+    else:
+        carousel_breakdown = []
+
     return {
         "terminal_distribution": terminal_distribution,
         "category_breakdown": category_breakdown,
         "peak_hours": peak_hours,
+        "carousel_breakdown": carousel_breakdown,
     }
 
 def _df_to_records(df: Optional[pd.DataFrame], limit: Optional[int] = None) -> List[Dict[str, object]]:
@@ -1651,6 +1945,7 @@ def set_session_state(
     if payload.wizard_state is not None:
         record.wizard_state = payload.wizard_state
     _touch_session(record)
+    _save_session_to_disk(record)
     return {
         "current_step": record.current_step,
         "wizard_state": record.wizard_state,
@@ -1720,6 +2015,38 @@ def validate_carousels(file: UploadFile = File(...)):
     return {"valid": True, "carousels": carousels, "errors": []}
 
 
+def _compute_input_analytics(df: pd.DataFrame) -> dict:
+    result: dict = {
+        "total_flights": len(df),
+        "date_range": {"min": "", "max": ""},
+        "by_hour": [],
+        "by_category": [],
+        "by_terminal": [],
+    }
+    try:
+        dt = pd.to_datetime(df["DepartureTime"], errors="coerce")
+        valid = dt.dropna()
+        if len(valid):
+            result["date_range"] = {"min": str(valid.min()), "max": str(valid.max())}
+        by_hour = dt.dt.hour.value_counts().sort_index()
+        result["by_hour"] = [{"hour": int(h), "count": int(c)} for h, c in by_hour.items()]
+    except Exception:
+        pass
+    try:
+        if "Category" in df.columns:
+            by_cat = df["Category"].value_counts()
+            result["by_category"] = [{"category": str(k), "count": int(v)} for k, v in by_cat.items()]
+    except Exception:
+        pass
+    try:
+        if "Terminal" in df.columns:
+            by_term = df["Terminal"].value_counts()
+            result["by_terminal"] = [{"terminal": str(k), "count": int(v)} for k, v in by_term.items()]
+    except Exception:
+        pass
+    return result
+
+
 @app.post("/api/run")
 def run(
     request: Request,
@@ -1727,6 +2054,7 @@ def run(
     file: Optional[UploadFile] = File(None),
     config_json: Optional[str] = Form(None),
     config: Optional[str] = Form(None),
+    scenario_name: Optional[str] = Form(None),
 ):
     session_id = _get_session_id(request)
     record_session = _ensure_session(session_id)
@@ -1739,7 +2067,8 @@ def run(
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    record = JobRecord(job_id=job_id, status="running", created_at=_utc_now(), job_dir=job_dir)
+    record = JobRecord(job_id=job_id, status="running", created_at=_utc_now(), job_dir=job_dir,
+                       scenario_name=scenario_name.strip() if scenario_name and scenario_name.strip() else None)
     JOB_STORE[job_id] = record
 
     try:
@@ -1754,6 +2083,14 @@ def run(
         df_mapped, keep_extra_cols = _apply_column_mapping(df_raw, cfg.columns)
         df_std, mapping_warnings = _apply_cat_term_mapping(df_mapped, cfg.mapping.categories, cfg.mapping.terminals)
         df_ready, makeup_warnings = _apply_makeup(df_std, cfg.makeup)
+
+        # ── Données d'entrée ──────────────────────────────────────────────
+        input_analytics: dict = {}
+        try:
+            df_std.to_csv(job_dir / "input_data.csv", index=False)
+            input_analytics = _compute_input_analytics(df_std)
+        except Exception:
+            pass
 
         results = _run_allocation_pipeline(df_ready, cfg)
         results["warnings_rows"] = mapping_warnings + makeup_warnings + results.get("warnings_rows", [])
@@ -1780,9 +2117,11 @@ def run(
 
         kpis = _compute_kpis(results["flights_readjusted"], results["unassigned_df"])
         analytics = _compute_analytics(results["flights_readjusted"])
+        if input_analytics:
+            analytics["input"] = input_analytics
         warnings_rows = results.get("warnings_rows", [])
         tables = {
-            "flights_preview": _df_to_records(results.get("flights_readjusted"), limit=20),
+            "flights_preview": _df_to_records(results.get("flights_readjusted")),
             "unassigned": _df_to_records(results.get("unassigned_df")),
             "extras_needed": _df_to_records(results.get("extra_makeups_df")),
         }
@@ -1796,8 +2135,12 @@ def run(
         record.downloads = {
             key: f"/api/jobs/{job_id}/download/{name}" for key, name in downloads.items()
         }
+        if (job_dir / "input_data.csv").exists():
+            record.downloads["input_data_csv"] = f"/api/jobs/{job_id}/download/input_data.csv"
         record_session.last_job_id = job_id
         _touch_session(record_session)
+        _save_job_to_disk(record)
+        _save_session_to_disk(record_session)
 
         return {
             "job_id": job_id,
@@ -1821,6 +2164,111 @@ def run(
         raise HTTPException(status_code=500, detail=f"Allocation failed: {exc}")
 
 
+# ── Custom KPI endpoints ────────────────────────────────────────────────────
+
+@app.get("/api/kpis")
+def list_custom_kpis():
+    kpis = sorted(CUSTOM_KPI_STORE.values(), key=lambda k: k.created_at)
+    return [
+        {
+            "kpi_id": k.kpi_id,
+            "name": k.name,
+            "metric": k.metric,
+            "display_type": k.display_type,
+            "description": k.description,
+            "alert_enabled": k.alert_enabled,
+            "alert_operator": k.alert_operator,
+            "alert_threshold": k.alert_threshold,
+            "created_at": k.created_at,
+        }
+        for k in kpis
+    ]
+
+
+@app.post("/api/kpis")
+def create_custom_kpi(payload: CustomKPIPayload):
+    if not payload.name.strip():
+        raise HTTPException(status_code=400, detail="Le nom du KPI est requis.")
+    if not payload.metric.strip():
+        raise HTTPException(status_code=400, detail="La metrique est requise.")
+    kpi_id = str(uuid.uuid4())
+    kpi = CustomKPI(
+        kpi_id=kpi_id,
+        name=payload.name.strip(),
+        metric=payload.metric,
+        display_type=payload.display_type,
+        description=payload.description.strip(),
+        alert_enabled=payload.alert_enabled,
+        alert_operator=payload.alert_operator,
+        alert_threshold=payload.alert_threshold,
+        created_at=_utc_now(),
+    )
+    CUSTOM_KPI_STORE[kpi_id] = kpi
+    _save_custom_kpis_to_disk()
+    return {
+        "kpi_id": kpi.kpi_id,
+        "name": kpi.name,
+        "metric": kpi.metric,
+        "display_type": kpi.display_type,
+        "description": kpi.description,
+        "alert_enabled": kpi.alert_enabled,
+        "alert_operator": kpi.alert_operator,
+        "alert_threshold": kpi.alert_threshold,
+        "created_at": kpi.created_at,
+    }
+
+
+@app.delete("/api/kpis/{kpi_id}")
+def delete_custom_kpi(kpi_id: str):
+    if kpi_id not in CUSTOM_KPI_STORE:
+        raise HTTPException(status_code=404, detail="KPI non trouve.")
+    del CUSTOM_KPI_STORE[kpi_id]
+    _save_custom_kpis_to_disk()
+    return {"ok": True}
+
+
+# ── Admin / migration endpoints ─────────────────────────────────────────────
+
+@app.post("/api/admin/migrate")
+def admin_migrate():
+    """Force-push all in-memory jobs to Supabase. Call once after setting SUPABASE_KEY."""
+    sb = _get_supabase()
+    if not sb:
+        return {"ok": False, "detail": "Supabase not configured (SUPABASE_URL / SUPABASE_KEY manquants)"}
+    pushed = 0
+    errors = 0
+    for record in list(JOB_STORE.values()):
+        if record.status == "done":
+            try:
+                _save_job_to_supabase(record)
+                pushed += 1
+            except Exception:
+                errors += 1
+    return {"ok": True, "pushed": pushed, "errors": errors}
+
+
+# ── Job list / detail endpoints ─────────────────────────────────────────────
+
+@app.get("/api/jobs")
+def list_jobs(limit: int = 100):
+    done_jobs = [r for r in JOB_STORE.values() if r.status == "done"]
+    done_jobs.sort(key=lambda r: r.created_at or "", reverse=True)
+    done_jobs = done_jobs[:limit]
+    return [
+        {
+            "job_id": r.job_id,
+            "scenario_name": r.scenario_name,
+            "status": r.status,
+            "created_at": r.created_at,
+            "finished_at": r.finished_at,
+            "storage_size_bytes": r.storage_size_bytes,
+            "kpis": r.kpis,
+            "analytics": r.analytics,
+        }
+        for r in done_jobs
+    ]
+
+
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
     record = JOB_STORE.get(job_id)
@@ -1828,9 +2276,11 @@ def get_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     return {
         "job_id": record.job_id,
+        "scenario_name": record.scenario_name,
         "status": record.status,
         "created_at": record.created_at,
         "finished_at": record.finished_at,
+        "storage_size_bytes": record.storage_size_bytes,
         "kpis": record.kpis,
         "analytics": record.analytics,
         "warnings": record.warnings,
@@ -1855,7 +2305,7 @@ def download(job_id: str, filename: str):
 
 
 @app.get("/api/jobs/{job_id}/preview/{filename}")
-def preview_result(job_id: str, filename: str, limit: int = 20):
+def preview_result(job_id: str, filename: str, limit: int = 50, offset: int = 0):
     record = JOB_STORE.get(job_id)
     if not record or not record.job_dir:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1868,11 +2318,17 @@ def preview_result(job_id: str, filename: str, limit: int = 20):
         raise HTTPException(status_code=400, detail="Preview is only available for CSV files")
 
     df = pd.read_csv(file_path)
+    total_rows = len(df)
+    if offset > 0:
+        df = df.iloc[int(offset):]
     if limit > 0:
         df = df.head(int(limit))
     return {
         "columns": df.columns.tolist(),
         "rows": df.fillna("").to_dict(orient="records"),
+        "total_rows": total_rows,
+        "offset": offset,
+        "limit": limit,
     }
 
 

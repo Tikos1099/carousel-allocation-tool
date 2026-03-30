@@ -19,6 +19,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { InputDataTab } from "@/components/job/input-data-tab"
 
 function DataTable({ rows }: { rows: Record<string, unknown>[] }) {
   const columns = rows.length > 0 ? Object.keys(rows[0]) : []
@@ -233,13 +234,18 @@ function ResultsContent() {
         </Card>
       )}
 
-      <Tabs defaultValue="flights" className="space-y-4">
+      <Tabs defaultValue="input" className="space-y-4">
         <TabsList>
+          <TabsTrigger value="input">Données d{"'"}entrée</TabsTrigger>
           <TabsTrigger value="flights">Apercu vols</TabsTrigger>
           <TabsTrigger value="unassigned">Vols non assignes</TabsTrigger>
           <TabsTrigger value="extras">Extras necessaires</TabsTrigger>
           <TabsTrigger value="downloads">Telechargements</TabsTrigger>
         </TabsList>
+
+        <TabsContent value="input">
+          <InputDataTab job={job} />
+        </TabsContent>
 
         <TabsContent value="flights">
           <Card>

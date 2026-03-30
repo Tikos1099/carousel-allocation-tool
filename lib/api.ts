@@ -64,9 +64,11 @@ export interface SessionState {
 
 export interface JobResult {
   jobId: string
+  scenarioName?: string
   status: "queued" | "running" | "done" | "error"
   createdAt?: string
   finishedAt?: string
+  storageSizeBytes?: number
   kpis: {
     totalFlights: number
     assignedPct: number
@@ -87,6 +89,14 @@ export interface JobResult {
     terminalDistribution?: { terminal: string; count: number }[]
     categoryBreakdown?: { category: string; assigned: number; unassigned: number }[]
     peakHours?: { hour: string; flights: number }[]
+    carouselBreakdown?: { carousel: string; terminal: string; count: number }[]
+  }
+  inputAnalytics?: {
+    totalFlights: number
+    dateRange: { min: string; max: string }
+    byHour: { hour: number; count: number }[]
+    byCategory: { category: string; count: number }[]
+    byTerminal: { terminal: string; count: number }[]
   }
   error?: string
 }
@@ -294,9 +304,11 @@ function mapJobResult(payload: Record<string, unknown>): JobResult {
   const analytics = (payload.analytics as Record<string, unknown>) || {}
   return {
     jobId: String(payload.job_id || payload.jobId || ""),
+    scenarioName: (payload.scenario_name as string) || undefined,
     status: (payload.status as JobResult["status"]) || "error",
     createdAt: (payload.created_at as string) || (payload.createdAt as string),
     finishedAt: (payload.finished_at as string) || (payload.finishedAt as string),
+    storageSizeBytes: typeof payload.storage_size_bytes === "number" ? payload.storage_size_bytes : undefined,
     kpis: {
       totalFlights: Number(kpis.total_flights || 0),
       assignedPct: Number(kpis.assigned_pct || 0),
@@ -326,18 +338,51 @@ function mapJobResult(payload: Record<string, unknown>): JobResult {
         (analytics.peak_hours as { hour: string; flights: number }[]) || [],
     },
     error: (payload.error as string) || undefined,
+    inputAnalytics: (() => {
+      const inp = (analytics as Record<string, unknown>)?.input as Record<string, unknown> | undefined
+      if (!inp) return undefined
+      return {
+        totalFlights: Number(inp.total_flights || 0),
+        dateRange: (inp.date_range as { min: string; max: string }) || { min: "", max: "" },
+        byHour: (inp.by_hour as { hour: number; count: number }[]) || [],
+        byCategory: (inp.by_category as { category: string; count: number }[]) || [],
+        byTerminal: (inp.by_terminal as { terminal: string; count: number }[]) || [],
+      }
+    })(),
+  }
+}
+
+export async function previewInputData(
+  jobId: string,
+  offset = 0,
+  limit = 50
+): Promise<{ columns: string[]; rows: Record<string, unknown>[]; totalRows: number }> {
+  const res = await fetch(
+    buildUrl(`/api/jobs/${jobId}/preview/input_data.csv?limit=${limit}&offset=${offset}`),
+    withSessionHeaders({ method: "GET" })
+  )
+  if (!res.ok) return { columns: [], rows: [], totalRows: 0 }
+  const data = (await res.json()) as Record<string, unknown>
+  return {
+    columns: (data.columns as string[]) || [],
+    rows: (data.rows as Record<string, unknown>[]) || [],
+    totalRows: Number(data.total_rows || 0),
   }
 }
 
 export async function runJob(
   file: File | null,
-  config: AllocationConfig
+  config: AllocationConfig,
+  scenarioName?: string
 ): Promise<{ jobId: string }> {
   const formData = new FormData()
   if (file) {
     formData.append("file", file)
   }
   formData.append("config_json", JSON.stringify(buildConfigPayload(config)))
+  if (scenarioName) {
+    formData.append("scenario_name", scenarioName)
+  }
 
   const res = await fetch(
     buildUrl("/api/run"),
@@ -353,6 +398,132 @@ export async function runJob(
   captureSessionId(res)
   const data = (await res.json()) as Record<string, unknown>
   return { jobId: String(data.job_id || data.jobId || "") }
+}
+
+export interface CustomKPI {
+  kpiId: string
+  name: string
+  metric: string
+  displayType: "percentage" | "counter" | "text"
+  description: string
+  alertEnabled: boolean
+  alertOperator: "lt" | "gt"
+  alertThreshold: number
+  createdAt?: string
+}
+
+function mapCustomKPI(payload: Record<string, unknown>): CustomKPI {
+  return {
+    kpiId: String(payload.kpi_id || ""),
+    name: String(payload.name || ""),
+    metric: String(payload.metric || ""),
+    displayType: (payload.display_type as CustomKPI["displayType"]) || "counter",
+    description: String(payload.description || ""),
+    alertEnabled: Boolean(payload.alert_enabled),
+    alertOperator: (payload.alert_operator as "lt" | "gt") || "lt",
+    alertThreshold: Number(payload.alert_threshold || 0),
+    createdAt: (payload.created_at as string) || undefined,
+  }
+}
+
+export async function getCustomKPIs(): Promise<CustomKPI[]> {
+  const res = await fetch(buildUrl("/api/kpis"), withSessionHeaders({ method: "GET" }))
+  if (!res.ok) return []
+  const data = (await res.json()) as Record<string, unknown>[]
+  return data.map(mapCustomKPI)
+}
+
+export async function createCustomKPI(payload: {
+  name: string
+  metric: string
+  displayType: string
+  description: string
+  alertEnabled: boolean
+  alertOperator: string
+  alertThreshold: number
+}): Promise<CustomKPI> {
+  const headers = new Headers(withSessionHeaders().headers || {})
+  headers.set("Content-Type", "application/json")
+  const res = await fetch(buildUrl("/api/kpis"), {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      name: payload.name,
+      metric: payload.metric,
+      display_type: payload.displayType,
+      description: payload.description,
+      alert_enabled: payload.alertEnabled,
+      alert_operator: payload.alertOperator,
+      alert_threshold: payload.alertThreshold,
+    }),
+  })
+  if (!res.ok) {
+    const message = await parseError(res)
+    throw new Error(message)
+  }
+  const data = (await res.json()) as Record<string, unknown>
+  return mapCustomKPI(data)
+}
+
+export async function deleteCustomKPI(kpiId: string): Promise<void> {
+  const res = await fetch(
+    buildUrl(`/api/kpis/${kpiId}`),
+    withSessionHeaders({ method: "DELETE" })
+  )
+  if (!res.ok) {
+    const message = await parseError(res)
+    throw new Error(message)
+  }
+}
+
+export interface JobSummary {
+  jobId: string
+  scenarioName?: string
+  createdAt?: string
+  finishedAt?: string
+  storageSizeBytes?: number
+  kpis: JobResult["kpis"]
+  analytics?: JobResult["analytics"]
+}
+
+function mapJobSummary(payload: Record<string, unknown>): JobSummary {
+  const kpis = (payload.kpis as Record<string, unknown>) || {}
+  const analytics = (payload.analytics as Record<string, unknown>) || {}
+  return {
+    jobId: String(payload.job_id || ""),
+    scenarioName: (payload.scenario_name as string) || undefined,
+    createdAt: (payload.created_at as string) || undefined,
+    finishedAt: (payload.finished_at as string) || undefined,
+    storageSizeBytes: typeof payload.storage_size_bytes === "number" ? payload.storage_size_bytes : undefined,
+    kpis: {
+      totalFlights: Number(kpis.total_flights || 0),
+      assignedPct: Number(kpis.assigned_pct || 0),
+      unassignedCount: Number(kpis.unassigned_count || 0),
+      splitCount: Number(kpis.split_count || 0),
+      splitPct: Number(kpis.split_pct || 0),
+      narrowWideCount: Number(kpis.narrow_wide_count || 0),
+      narrowWidePct: Number(kpis.narrow_wide_pct || 0),
+    },
+    analytics: {
+      terminalDistribution:
+        (analytics.terminal_distribution as { terminal: string; count: number }[]) || [],
+      categoryBreakdown:
+        (analytics.category_breakdown as { category: string; assigned: number; unassigned: number }[]) || [],
+      peakHours:
+        (analytics.peak_hours as { hour: string; flights: number }[]) || [],
+    },
+  }
+}
+
+export async function getJobs(limit = 100): Promise<JobSummary[]> {
+  const res = await fetch(
+    buildUrl(`/api/jobs?limit=${limit}`),
+    withSessionHeaders({ method: "GET" })
+  )
+  if (!res.ok) return []
+  captureSessionId(res)
+  const data = (await res.json()) as Record<string, unknown>[]
+  return data.map(mapJobSummary)
 }
 
 export async function getJob(jobId: string): Promise<JobResult> {

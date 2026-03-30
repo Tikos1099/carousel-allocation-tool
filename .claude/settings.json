@@ -5,7 +5,11 @@
       "Bash(npm install)",
       "Bash(npm audit)",
       "Bash(npm install next@16.1.6)",
-      "Bash(npm install next@16.1.6 --legacy-peer-deps)"
+      "Bash(npm install next@16.1.6 --legacy-peer-deps)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(node -e \":*)",
+      "Bash(npm run:*)"
     ]
   }
 }

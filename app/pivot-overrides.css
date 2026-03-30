@@ -1,0 +1,293 @@
+/* ─────────────────────────────────────────────────────────────
+   Pivot Explorer — design overrides to match the app theme
+   ───────────────────────────────────────────────────────────── */
+
+/* ── Reset base ── */
+.pvtUi {
+  font-family: inherit;
+  font-size: 13px;
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 6px;
+}
+
+/* ── Top-left controls bar (renderer + aggregation) ── */
+.pvtUi td.pvtRenderers {
+  background: hsl(var(--muted));
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  padding: 8px 10px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.pvtUi td.pvtVals {
+  background: hsl(var(--muted));
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  padding: 8px 10px;
+  vertical-align: middle;
+}
+
+/* ── Select dropdowns (renderer, aggregation, attr dropdowns) ── */
+.pvtRenderers select,
+.pvtAggregator select,
+.pvtAttrDropdown select,
+.pvtAttr select {
+  height: 30px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-family: inherit;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.pvtRenderers select:focus,
+.pvtAggregator select:focus {
+  border-color: hsl(var(--primary));
+  box-shadow: 0 0 0 2px hsl(var(--primary) / 0.15);
+}
+
+/* ── Field list container (unused fields) ── */
+.pvtAxisContainer.pvtUnused {
+  background: hsl(var(--background));
+  border: 1px dashed hsl(var(--border));
+  border-radius: 8px;
+  padding: 10px 8px 8px;
+  vertical-align: top;
+  min-width: 160px;
+  max-width: 180px;
+}
+
+/* ── Drop zones (rows, cols) ── */
+.pvtAxisContainer.pvtRows,
+.pvtAxisContainer.pvtCols {
+  background: hsl(var(--muted) / 0.5);
+  border: 1.5px dashed hsl(var(--border));
+  border-radius: 8px;
+  padding: 8px;
+  vertical-align: top;
+  min-height: 52px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.pvtAxisContainer.pvtRows:hover,
+.pvtAxisContainer.pvtCols:hover {
+  background: hsl(var(--accent));
+  border-color: hsl(var(--primary) / 0.4);
+}
+
+/* ── Axis labels (Rows / Columns / Values) ── */
+.pvtAxisContainer span.pvtAxisLabel {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: hsl(var(--muted-foreground));
+  display: block;
+  margin-bottom: 6px;
+}
+
+/* ── Field pills (all) ── */
+.pvtAttr {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 4px;
+  background: hsl(var(--background));
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  padding: 3px 8px !important;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: grab;
+  margin: 2px !important;
+  color: hsl(var(--foreground));
+  transition: all 0.12s;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+.pvtAttr:hover {
+  border-color: hsl(var(--primary) / 0.5);
+  background: hsl(var(--accent));
+  color: hsl(var(--accent-foreground));
+}
+
+/* ── Active/placed field pills (in rows/cols) ── */
+.pvtAxisContainer.pvtRows .pvtAttr,
+.pvtAxisContainer.pvtCols .pvtAttr {
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  border-color: hsl(var(--primary));
+  font-weight: 500;
+}
+.pvtAxisContainer.pvtRows .pvtAttr:hover,
+.pvtAxisContainer.pvtCols .pvtAttr:hover {
+  background: hsl(var(--primary) / 0.85);
+  color: hsl(var(--primary-foreground));
+}
+
+/* Arrow buttons on field pills */
+.pvtAttr select,
+.pvtAttr .pvtAttrDropdown {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  padding: 0 2px;
+  cursor: pointer;
+}
+
+/* ── Tri-state button (sort toggle) ── */
+.pvtTriangle {
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+/* ── Output area ── */
+.pvtOutput {
+  padding: 4px;
+  vertical-align: top;
+}
+
+/* ── Pivot table ── */
+.pvtTable {
+  border-collapse: collapse;
+  font-size: 12px;
+  font-family: inherit;
+  width: auto;
+}
+.pvtTable thead tr th,
+.pvtColLabel {
+  background: hsl(var(--muted));
+  border: 1px solid hsl(var(--border));
+  padding: 5px 12px;
+  font-weight: 600;
+  text-align: center;
+  white-space: nowrap;
+  color: hsl(var(--foreground));
+}
+.pvtTable tbody tr td {
+  border: 1px solid hsl(var(--border));
+  padding: 4px 12px;
+  text-align: right;
+  color: hsl(var(--foreground));
+}
+.pvtRowLabel {
+  background: hsl(var(--muted));
+  border: 1px solid hsl(var(--border));
+  padding: 4px 12px;
+  text-align: left;
+  font-weight: 500;
+  white-space: nowrap;
+  color: hsl(var(--foreground));
+}
+.pvtVal {
+  text-align: right;
+  min-width: 60px;
+}
+.pvtGrandTotal,
+.pvtGrandTotalLabel {
+  background: hsl(var(--primary) / 0.08);
+  font-weight: 700;
+  color: hsl(var(--primary));
+  border: 1px solid hsl(var(--primary) / 0.2);
+}
+.pvtTotalLabel {
+  background: hsl(var(--primary) / 0.08);
+  font-weight: 600;
+  color: hsl(var(--primary));
+  border: 1px solid hsl(var(--primary) / 0.2);
+  padding: 4px 12px;
+}
+.pvtTable tbody tr:hover td,
+.pvtTable tbody tr:hover th {
+  background: hsl(var(--muted) / 0.7);
+}
+
+/* ── Filter popup ── */
+.pvtFilterBox {
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  padding: 12px;
+  background: hsl(var(--background));
+  z-index: 200;
+  min-width: 200px;
+}
+.pvtSearch {
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  width: 100%;
+  margin-bottom: 8px;
+  outline: none;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+.pvtSearch:focus {
+  border-color: hsl(var(--primary));
+  box-shadow: 0 0 0 2px hsl(var(--primary) / 0.15);
+}
+.pvtCheckContainer {
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+.pvtCheckContainer p {
+  padding: 3px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.pvtCheckContainer p:hover {
+  background: hsl(var(--muted));
+}
+.pvtButton {
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  margin-top: 8px;
+  transition: opacity 0.15s;
+}
+.pvtButton:hover {
+  opacity: 0.88;
+}
+.pvtCloseX {
+  float: right;
+  cursor: pointer;
+  font-size: 16px;
+  color: hsl(var(--muted-foreground));
+  line-height: 1;
+  padding: 0 2px;
+  transition: color 0.15s;
+}
+.pvtCloseX:hover {
+  color: hsl(var(--destructive));
+}
+
+/* ── Drag-over highlight ── */
+.pvtAxisContainer.pvtRows.pvtDropTarget,
+.pvtAxisContainer.pvtCols.pvtDropTarget {
+  background: hsl(var(--accent));
+  border-color: hsl(var(--primary));
+  border-style: solid;
+}
+
+/* ── Plotly chart container ── */
+.pvtOutput .js-plotly-plot {
+  border-radius: 8px;
+  overflow: hidden;
+}
