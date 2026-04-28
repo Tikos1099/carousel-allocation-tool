@@ -3,6 +3,7 @@
 import { Check } from "lucide-react"
 
 import { cn } from "@/lib/utils"
+import { useI18n } from "@/lib/i18n"
 
 interface Step {
   id: number
@@ -16,6 +17,7 @@ interface WizardStepperProps {
 }
 
 export function WizardStepper({ steps, currentStep }: WizardStepperProps) {
+  const { t } = useI18n()
   return (
     <div className="w-full">
       <div className="hidden md:block">
@@ -76,7 +78,7 @@ export function WizardStepper({ steps, currentStep }: WizardStepperProps) {
           <div>
             <p className="font-medium">{steps[currentStep - 1]?.title}</p>
             <p className="text-sm text-muted-foreground">
-              Etape {currentStep} sur {steps.length}
+              {t.wizard.step} {currentStep} {t.wizard.stepOf} {steps.length}
             </p>
           </div>
         </div>

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import uuid
 
@@ -12,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
 import pandas as pd
@@ -2249,6 +2250,30 @@ def admin_migrate():
 
 # ── Job list / detail endpoints ─────────────────────────────────────────────
 
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: str):
+    record = JOB_STORE.get(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Job non trouve.")
+    # Remove from Supabase
+    sb = _get_supabase()
+    if sb:
+        try:
+            sb.table("jobs").delete().eq("job_id", job_id).execute()
+        except Exception:
+            pass
+    # Remove files from disk
+    if record.job_dir and record.job_dir.exists():
+        try:
+            import shutil
+            shutil.rmtree(record.job_dir)
+        except Exception:
+            pass
+    # Remove from memory
+    del JOB_STORE[job_id]
+    return {"ok": True}
+
+
 @app.get("/api/jobs")
 def list_jobs(limit: int = 100):
     done_jobs = [r for r in JOB_STORE.values() if r.status == "done"]
@@ -2451,6 +2476,883 @@ def baglist_download(job_id: str, filename: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path=file_path, filename=safe_name)
+
+
+# ─── Mapping Tool ─────────────────────────────────────────────────────────────
+
+class MappingColumnDef(BaseModel):
+    target_name: str
+    source_col: str = ""
+    formula: str = ""
+    is_pk: bool = False
+    aggregation: str = "First"
+    format: str = "Auto"
+    include_in_output: bool = True
+
+    class Config:
+        extra = "ignore"
+
+
+class MappingFilterRule(BaseModel):
+    col: str
+    op: str  # "=", "<>", ">", "<", ">=", "<=", "contains", "not_contains", "starts_with", "ends_with", "is_empty", "is_not_empty"
+    val: str = ""
+
+    class Config:
+        extra = "ignore"
+
+
+class MappingExecuteConfig(BaseModel):
+    columns: List[MappingColumnDef]
+    filters: List[MappingFilterRule] = []
+    output_filters: List[MappingFilterRule] = []
+    dedup_by_pk: bool = False
+    output_format: Literal["csv", "excel"] = "csv"
+    output_filename: str = "mapping_output.csv"
+
+    class Config:
+        extra = "ignore"
+
+
+def _read_df_from_bytes(content: bytes, filename: str, nrows: Optional[int] = None) -> pd.DataFrame:
+    fn = (filename or "").lower()
+    if fn.endswith(".csv"):
+        return _read_csv_auto(content, nrows=nrows)
+    buf = BytesIO(content)
+    if fn.endswith(".xls"):
+        return pd.read_excel(buf, engine="xlrd", nrows=nrows)
+    return pd.read_excel(buf, engine="openpyxl", nrows=nrows)
+
+
+def _split_formula_args(s: str) -> list:
+    """Split comma-separated formula arguments respecting nested parentheses and quoted strings."""
+    args: list = []
+    depth = 0
+    in_quote = False
+    quote_char = ""
+    current: list = []
+    for ch in s:
+        if ch in ('"', "'") and not in_quote:
+            in_quote, quote_char = True, ch
+            current.append(ch)
+        elif ch == quote_char and in_quote:
+            in_quote = False
+            current.append(ch)
+        elif ch == "(" and not in_quote:
+            depth += 1
+            current.append(ch)
+        elif ch == ")" and not in_quote:
+            depth -= 1
+            current.append(ch)
+        elif ch == "," and depth == 0 and not in_quote:
+            args.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        args.append("".join(current).strip())
+    return args
+
+
+def _find_comparison_in_cond(s: str) -> Optional[tuple]:
+    """Find the first comparison operator at paren-depth=0 outside quotes.
+    Returns (op, left_str, right_str) or None. Operators checked longest-first."""
+    ops = (">=", "<=", "<>", "!=", ">", "<", "=")
+    in_quote = False
+    quote_char = ""
+    depth = 0
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch in ('"', "'") and not in_quote:
+            in_quote, quote_char = True, ch
+        elif ch == quote_char and in_quote:
+            in_quote = False
+        elif ch == "(" and not in_quote:
+            depth += 1
+        elif ch == ")" and not in_quote:
+            depth -= 1
+        elif depth == 0 and not in_quote:
+            for op in ops:
+                if s[i:i + len(op)] == op:
+                    return op, s[:i].strip(), s[i + len(op):].strip()
+        i += 1
+    return None
+
+
+def _rfind_op_at_depth0(expr: str, ops: tuple) -> Optional[tuple]:
+    """Find the rightmost operator from `ops` at paren-depth=0 outside quotes, position > 0.
+    Returns (op, left_str, right_str) or None."""
+    in_q = False; q_ch = ""; depth = 0
+    last_pos: Optional[int] = None; last_op: Optional[str] = None
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if ch in ('"', "'") and not in_q:
+            in_q, q_ch = True, ch
+        elif ch == q_ch and in_q:
+            in_q = False
+        elif ch == "(" and not in_q:
+            depth += 1
+        elif ch == ")" and not in_q:
+            depth -= 1
+        elif depth == 0 and not in_q and i > 0:
+            for op in ops:
+                if expr[i:i + len(op)] == op:
+                    last_pos, last_op = i, op
+                    break
+        i += 1
+    if last_pos is not None and last_op is not None:
+        return last_op, expr[:last_pos].strip(), expr[last_pos + len(last_op):].strip()
+    return None
+
+
+def _eval_condition(cond: str, df: pd.DataFrame) -> "pd.Series":
+    """Return a boolean Series for a condition string.
+    Supports AND/OR/NOT wrappers and comparisons like Col="val", LEFT(Col,3)>"X".
+    Operators are found at paren-depth=0 so nested formulas aren't split."""
+    import pandas as _pd
+    cond = cond.strip()
+    n = len(df)
+
+    # AND(cond1, cond2, ...)
+    m = re.match(r'^AND\((.+)\)$', cond, re.IGNORECASE | re.DOTALL)
+    if m:
+        parts = _split_formula_args(m.group(1))
+        result: "pd.Series" = _pd.Series([True] * n)
+        for p in parts:
+            result = result & _eval_condition(p.strip(), df)
+        return result.reset_index(drop=True)
+
+    # OR(cond1, cond2, ...)
+    m = re.match(r'^OR\((.+)\)$', cond, re.IGNORECASE | re.DOTALL)
+    if m:
+        parts = _split_formula_args(m.group(1))
+        result = _pd.Series([False] * n)
+        for p in parts:
+            result = result | _eval_condition(p.strip(), df)
+        return result.reset_index(drop=True)
+
+    # NOT(cond)
+    m = re.match(r'^NOT\((.+)\)$', cond, re.IGNORECASE | re.DOTALL)
+    if m:
+        return (~_eval_condition(m.group(1).strip(), df)).reset_index(drop=True)
+
+    # Comparison — depth-aware scan so operators inside parentheses are ignored
+    found = _find_comparison_in_cond(cond)
+    if found:
+        op_str, left_s, right_s = found
+
+        # Left side: evaluate as a formula (handles column refs, LEFT(Col,3), etc.)
+        try:
+            left_col = _eval_mapping_formula(left_s, df)
+        except Exception:
+            left_col = _pd.Series([left_s] * n)
+
+        # Right side: quoted string, numeric, column ref, or formula
+        if (right_s.startswith('"') and right_s.endswith('"')) or \
+           (right_s.startswith("'") and right_s.endswith("'")):
+            raw_str = right_s[1:-1]
+            if _pd.api.types.is_datetime64_any_dtype(left_col):
+                try:
+                    right_val: Any = _pd.to_datetime(raw_str)
+                except Exception:
+                    right_val = raw_str
+                    left_col = left_col.astype(str)
+            else:
+                right_val = raw_str
+                left_col = left_col.astype(str)
+        else:
+            try:
+                rv = float(right_s)
+                right_val = int(rv) if rv == int(rv) else rv
+                left_col = _pd.to_numeric(left_col, errors="coerce")
+            except ValueError:
+                # Column reference or formula on the right side
+                try:
+                    right_val = _eval_mapping_formula(right_s, df)
+                    left_col = left_col.astype(str)
+                    right_val = right_val.astype(str)
+                except Exception:
+                    right_val = right_s
+                    left_col = left_col.astype(str)
+
+        ops_map = {
+            ">=": lambda a, b: a >= b,
+            "<=": lambda a, b: a <= b,
+            "<>": lambda a, b: a != b,
+            "!=": lambda a, b: a != b,
+            ">":  lambda a, b: a > b,
+            "<":  lambda a, b: a < b,
+            "=":  lambda a, b: a == b,
+        }
+        try:
+            return ops_map[op_str](left_col, right_val).reset_index(drop=True)
+        except Exception:
+            return _pd.Series([False] * n)
+
+    return _pd.Series([True] * n)
+
+
+def _eval_mapping_formula(expr: str, df: pd.DataFrame) -> pd.Series:
+    expr = expr.strip()
+    n = len(df)
+    empty: pd.Series = pd.Series([""] * n, dtype=object)
+
+    if not expr:
+        return empty
+
+    # String constant
+    if (expr.startswith('"') and expr.endswith('"')) or (expr.startswith("'") and expr.endswith("'")):
+        return pd.Series([expr[1:-1]] * n)
+
+    # Numeric constant
+    try:
+        val = float(expr)
+        v: Any = int(val) if val == int(val) else val
+        return pd.Series([v] * n)
+    except (ValueError, TypeError):
+        pass
+
+    # Simple column reference
+    if expr in df.columns:
+        return df[expr].reset_index(drop=True)
+
+    # Parenthesized expression — strip outer parens and re-evaluate
+    if expr.startswith("(") and expr.endswith(")"):
+        _pdepth = 0; _fully = True
+        for _pi, _pc in enumerate(expr):
+            if _pc == "(": _pdepth += 1
+            elif _pc == ")": _pdepth -= 1
+            if _pdepth == 0 and _pi < len(expr) - 1:
+                _fully = False; break
+        if _fully:
+            return _eval_mapping_formula(expr[1:-1], df)
+
+    # LEFT(Col, k)
+    m = re.match(r'^LEFT\((.+),\s*(\d+)\)$', expr, re.IGNORECASE)
+    if m:
+        col, k = m.group(1).strip(), int(m.group(2))
+        if col in df.columns:
+            return df[col].astype(str).str[:k].reset_index(drop=True)
+
+    # RIGHT(Col, k)
+    m = re.match(r'^RIGHT\((.+),\s*(\d+)\)$', expr, re.IGNORECASE)
+    if m:
+        col, k = m.group(1).strip(), int(m.group(2))
+        if col in df.columns:
+            return df[col].astype(str).str[-k:].reset_index(drop=True)
+
+    # MID(Col, start, length)
+    m = re.match(r'^MID\((.+),\s*(\d+),\s*(\d+)\)$', expr, re.IGNORECASE)
+    if m:
+        col, s, lg = m.group(1).strip(), int(m.group(2)), int(m.group(3))
+        if col in df.columns:
+            return df[col].astype(str).str[s - 1:s - 1 + lg].reset_index(drop=True)
+
+    # LEN(Col)
+    m = re.match(r'^LEN\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        col = m.group(1).strip()
+        if col in df.columns:
+            return df[col].astype(str).str.len().reset_index(drop=True)
+
+    # UPPER(Col)
+    m = re.match(r'^UPPER\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        col = m.group(1).strip()
+        if col in df.columns:
+            return df[col].astype(str).str.upper().reset_index(drop=True)
+
+    # LOWER(Col)
+    m = re.match(r'^LOWER\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        col = m.group(1).strip()
+        if col in df.columns:
+            return df[col].astype(str).str.lower().reset_index(drop=True)
+
+    # TRIM(Col)
+    m = re.match(r'^TRIM\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        col = m.group(1).strip()
+        if col in df.columns:
+            return df[col].astype(str).str.strip().reset_index(drop=True)
+
+    # TEXTBEFORE(Col, "delim")
+    m = re.match(r'^TEXTBEFORE\((.+),\s*"(.*)"\)$', expr, re.IGNORECASE)
+    if m:
+        col, delim = m.group(1).strip(), m.group(2)
+        if col in df.columns:
+            return df[col].astype(str).apply(
+                lambda x: x.split(delim)[0] if delim in x else x
+            ).reset_index(drop=True)
+
+    # TEXTAFTER(Col, "delim")
+    m = re.match(r'^TEXTAFTER\((.+),\s*"(.*)"\)$', expr, re.IGNORECASE)
+    if m:
+        col, delim = m.group(1).strip(), m.group(2)
+        if col in df.columns:
+            return df[col].astype(str).apply(
+                lambda x: delim.join(x.split(delim)[1:]) if delim in x else x
+            ).reset_index(drop=True)
+
+    # SUBSTITUTE(Col, "old", "new"[, instance])  — replace occurrences
+    m = re.match(r'^SUBSTITUTE\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) >= 3:
+            col = args[0].strip()
+            old_val = args[1].strip().strip('"\'')
+            new_val = args[2].strip().strip('"\'')
+            src = _eval_mapping_formula(col, df).astype(str)
+            return src.str.replace(old_val, new_val, regex=False).reset_index(drop=True)
+
+    # VALUE(Col)  — convert text to number
+    m = re.match(r'^VALUE\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        src = _eval_mapping_formula(m.group(1).strip(), df)
+        return pd.to_numeric(src, errors="coerce").reset_index(drop=True)
+
+    # ROUND(Col, decimals)
+    m = re.match(r'^ROUND\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) == 2:
+            src = pd.to_numeric(_eval_mapping_formula(args[0].strip(), df), errors="coerce")
+            try:
+                decimals = int(args[1].strip())
+                return src.round(decimals).reset_index(drop=True)
+            except ValueError:
+                pass
+
+    # INT(Col)  — floor to integer
+    m = re.match(r'^INT\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        src = pd.to_numeric(_eval_mapping_formula(m.group(1).strip(), df), errors="coerce")
+        return src.apply(lambda x: int(x) if pd.notna(x) else "").reset_index(drop=True)
+
+    # ABS(Col)
+    m = re.match(r'^ABS\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        src = pd.to_numeric(_eval_mapping_formula(m.group(1).strip(), df), errors="coerce")
+        return src.abs().reset_index(drop=True)
+
+    # IFERROR(formula, fallback)  — return fallback if formula produces NaN/error
+    m = re.match(r'^IFERROR\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) == 2:
+            try:
+                result = _eval_mapping_formula(args[0].strip(), df)
+            except Exception:
+                result = pd.Series([""] * n, dtype=object)
+            fallback = _eval_mapping_formula(args[1].strip(), df)
+            combined = result.where(result.notna() & (result.astype(str) != "nan"), other=fallback)
+            return combined.reset_index(drop=True)
+
+    # ISNUMBER(Col)  — TRUE/FALSE
+    m = re.match(r'^ISNUMBER\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        src = _eval_mapping_formula(m.group(1).strip(), df)
+        return pd.to_numeric(src, errors="coerce").notna().reset_index(drop=True)
+
+    # ISBLANK(Col)  — TRUE if empty or null
+    m = re.match(r'^ISBLANK\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        src = _eval_mapping_formula(m.group(1).strip(), df)
+        return (src.isna() | (src.astype(str).str.strip() == "")).reset_index(drop=True)
+
+    # ISTEXT(Col)
+    m = re.match(r'^ISTEXT\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        src = _eval_mapping_formula(m.group(1).strip(), df)
+        return (pd.to_numeric(src, errors="coerce").isna() & src.notna()).reset_index(drop=True)
+
+    # DATE(year, month, day) — build a date from numeric parts (columns or constants)
+    m = re.match(r'^DATE\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) == 3:
+            y_s = pd.to_numeric(_eval_mapping_formula(args[0].strip(), df), errors="coerce")
+            mo_s = pd.to_numeric(_eval_mapping_formula(args[1].strip(), df), errors="coerce")
+            d_s = pd.to_numeric(_eval_mapping_formula(args[2].strip(), df), errors="coerce")
+            def _mk_ts(yr, mn, dy):
+                try: return pd.Timestamp(int(yr), int(mn), int(dy))
+                except Exception: return pd.NaT
+            return pd.Series([_mk_ts(yr, mn, dy) for yr, mn, dy in zip(y_s, mo_s, d_s)]).reset_index(drop=True)
+
+    # TODAY() — current date without time
+    if re.match(r'^TODAY\(\)$', expr, re.IGNORECASE):
+        return pd.Series([pd.Timestamp.today().normalize()] * n)
+
+    # NOW() — current datetime
+    if re.match(r'^NOW\(\)$', expr, re.IGNORECASE):
+        return pd.Series([pd.Timestamp.now()] * n)
+
+    # YEAR/MONTH/DAY/HOUR/MINUTE/SECOND(Col) — extract date/time component
+    m = re.match(r'^(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        fn = m.group(1).upper()
+        src_eval = _eval_mapping_formula(m.group(2).strip(), df)
+
+        # timedelta64: pandas reads Excel "time" columns as timedelta (e.g. 0 days 22:45:00)
+        if pd.api.types.is_timedelta64_dtype(src_eval) and fn in ("HOUR", "MINUTE", "SECOND"):
+            ts = src_eval.dt.total_seconds()
+            if fn == "HOUR":   return (ts // 3600).reset_index(drop=True)
+            if fn == "MINUTE": return ((ts % 3600) // 60).reset_index(drop=True)
+            if fn == "SECOND": return (ts % 60).reset_index(drop=True)
+
+        # float fraction 0–1: Excel time serial (0.9479... = 22:45) — no .astype(int) to avoid NaN crash
+        if pd.api.types.is_numeric_dtype(src_eval) and fn in ("HOUR", "MINUTE", "SECOND"):
+            ts = src_eval % 1 * 86400
+            if fn == "HOUR":   return (ts // 3600).reset_index(drop=True)
+            if fn == "MINUTE": return ((ts % 3600) // 60).reset_index(drop=True)
+            if fn == "SECOND": return (ts % 60).reset_index(drop=True)
+
+        # Convert to datetime64 for all other cases
+        if pd.api.types.is_datetime64_any_dtype(src_eval):
+            src_dt = src_eval
+        elif pd.api.types.is_timedelta64_dtype(src_eval):
+            src_dt = pd.Timestamp("2000-01-01") + src_eval
+        else:
+            def _coerce_dt(x):
+                try:
+                    if x is None or (not hasattr(x, 'hour') and pd.isna(x)):
+                        return pd.NaT
+                    if hasattr(x, 'hour') and hasattr(x, 'minute'):
+                        # datetime.time or datetime.datetime objects
+                        return pd.Timestamp(2000, 1, 1, x.hour, x.minute, getattr(x, 'second', 0))
+                    if hasattr(x, 'total_seconds'):
+                        # timedelta object (scalar)
+                        s = float(x.total_seconds())
+                        return pd.Timestamp(2000, 1, 1, int(s // 3600), int(s % 3600 // 60), int(s % 60))
+                    return pd.to_datetime(x, errors='coerce')
+                except Exception:
+                    return pd.NaT
+            src_dt = src_eval.apply(_coerce_dt)
+
+        parts = {"YEAR": src_dt.dt.year, "MONTH": src_dt.dt.month, "DAY": src_dt.dt.day,
+                 "HOUR": src_dt.dt.hour, "MINUTE": src_dt.dt.minute, "SECOND": src_dt.dt.second}
+        return parts[fn].reset_index(drop=True)
+
+    # DATEVALUE(Col) — parse text to date (time stripped)
+    m = re.match(r'^DATEVALUE\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        src = _eval_mapping_formula(m.group(1).strip(), df)
+        return pd.to_datetime(src, errors="coerce").dt.normalize().reset_index(drop=True)
+
+    # TIMEVALUE(Col) — parse time, return fraction of day (0.0–1.0)
+    m = re.match(r'^TIMEVALUE\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        src = _eval_mapping_formula(m.group(1).strip(), df)
+        dt_t = pd.to_datetime(src, errors="coerce")
+        return ((dt_t.dt.hour * 3600 + dt_t.dt.minute * 60 + dt_t.dt.second) / 86400.0).reset_index(drop=True)
+
+    # TEXT(Col, "format") — format date/number as string
+    # Convention: MM=month, mm=minute, dd=day, yyyy=year, HH/hh=hour, ss=second
+    m = re.match(r'^TEXT\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) == 2:
+            src = _eval_mapping_formula(args[0].strip(), df)
+            fmt_raw = args[1].strip().strip("\"'")
+            py_chars: list = []; fi = 0
+            while fi < len(fmt_raw):
+                if fmt_raw[fi:fi+4] == "yyyy":   py_chars.append("%Y"); fi += 4
+                elif fmt_raw[fi:fi+2] == "yy":   py_chars.append("%y"); fi += 2
+                elif fmt_raw[fi:fi+2] == "MM":   py_chars.append("%m"); fi += 2
+                elif fmt_raw[fi:fi+2] == "dd":   py_chars.append("%d"); fi += 2
+                elif fmt_raw[fi:fi+2] in ("HH", "hh"): py_chars.append("%H"); fi += 2
+                elif fmt_raw[fi:fi+2] == "mm":   py_chars.append("%M"); fi += 2
+                elif fmt_raw[fi:fi+2] == "ss":   py_chars.append("%S"); fi += 2
+                else: py_chars.append(fmt_raw[fi]); fi += 1
+            py_fmt = "".join(py_chars)
+            return pd.to_datetime(src, errors="coerce").dt.strftime(py_fmt).reset_index(drop=True)
+
+    # DATEADD(date, n, "unit") — add a time delta to a date column
+    m = re.match(r'^DATEADD\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) == 3:
+            dt_da = pd.to_datetime(_eval_mapping_formula(args[0].strip(), df), errors="coerce")
+            n_da = pd.to_numeric(_eval_mapping_formula(args[1].strip(), df), errors="coerce").fillna(0)
+            unit_da = args[2].strip().strip("\"'").lower()
+            _u = {"day":"D","days":"D","d":"D","hour":"h","hours":"h","h":"h",
+                  "minute":"min","minutes":"min","m":"min","min":"min","second":"s","seconds":"s","s":"s"}
+            return (dt_da + pd.to_timedelta(n_da, unit=_u.get(unit_da, "D"))).reset_index(drop=True)
+
+    # DATEDIFF(date1, date2, "unit") — numeric difference between two dates
+    m = re.match(r'^DATEDIFF\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) >= 2:
+            dt1 = pd.to_datetime(_eval_mapping_formula(args[0].strip(), df), errors="coerce")
+            dt2 = pd.to_datetime(_eval_mapping_formula(args[1].strip(), df), errors="coerce")
+            unit_dd = args[2].strip().strip("\"'").lower() if len(args) >= 3 else "day"
+            diff = dt2 - dt1
+            if unit_dd in ("day", "days", "d"): return diff.dt.days.reset_index(drop=True)
+            if unit_dd in ("hour", "hours", "h"): return (diff.dt.total_seconds() / 3600).reset_index(drop=True)
+            if unit_dd in ("minute", "minutes", "m", "min"): return (diff.dt.total_seconds() / 60).reset_index(drop=True)
+            return diff.dt.days.reset_index(drop=True)
+
+    # TIMETOMIN(time_col [, day_col]) — convert time to total minutes, with optional day offset
+    # Handles all time formats: timedelta64, float fraction (0–1), datetime.time, datetime string
+    # Examples:  TIMETOMIN(UnloadTime)              → minutes since midnight (22:45 → 1365)
+    #            TIMETOMIN(UnloadTime, UnloadDay)   → day*1440 + time_minutes
+    m = re.match(r'^TIMETOMIN\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        t_src = _eval_mapping_formula(args[0].strip(), df)
+        if pd.api.types.is_timedelta64_dtype(t_src):
+            mins = t_src.dt.total_seconds() / 60
+        elif pd.api.types.is_numeric_dtype(t_src):
+            mins = t_src % 1 * 1440  # Excel time fraction → minutes
+        else:
+            def _t2s(x):
+                try:
+                    if x is None: return float("nan")
+                    if hasattr(x, 'hour'): return x.hour * 60 + x.minute + getattr(x, 'second', 0) / 60
+                    if hasattr(x, 'total_seconds'): return x.total_seconds() / 60
+                    ts = pd.to_datetime(x, errors='coerce')
+                    return float("nan") if pd.isna(ts) else ts.hour * 60 + ts.minute + ts.second / 60
+                except Exception: return float("nan")
+            mins = t_src.apply(_t2s)
+        if len(args) >= 2:
+            day_src = pd.to_numeric(_eval_mapping_formula(args[1].strip(), df), errors="coerce").fillna(0)
+            mins = mins + day_src * 1440
+        return mins.reset_index(drop=True)
+
+    # NOT(condition)
+    m = re.match(r'^NOT\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        return (~_eval_condition(m.group(1).strip(), df)).reset_index(drop=True)
+
+    # COALESCE(Col1, Col2, ...)  — first non-null/empty value
+    m = re.match(r'^COALESCE\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        result = pd.Series([""] * n, dtype=object)
+        for arg in reversed(args):
+            src = _eval_mapping_formula(arg.strip(), df)
+            mask = src.notna() & (src.astype(str).str.strip() != "")
+            result = src.where(mask, other=result)
+        return result.reset_index(drop=True)
+
+    # CONCAT(Col1, Col2, ...)  — multi-arg concatenation (alias for & chain)
+    m = re.match(r'^CONCAT\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        result_str = pd.Series([""] * n, dtype=str)
+        for arg in args:
+            src = _eval_mapping_formula(arg.strip(), df)
+            result_str = result_str + src.fillna("").astype(str)
+        return result_str.reset_index(drop=True)
+
+    # IF(condition, true_value, false_value)
+    # Examples:
+    #   IF(Terminal="T1", "T1", "Other")
+    #   IF(Weight>100, "Heavy", "Light")
+    #   IF(AND(Status="OK", Weight>50), "Good", "Bad")
+    #   IF(OR(Status="DELAYED", Status="CANCELLED"), "Issue", "OK")
+    m = re.match(r'^IF\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) == 3:
+            cond_str, true_str, false_str = args
+            condition = _eval_condition(cond_str, df)
+            true_series = _eval_mapping_formula(true_str.strip(), df)
+            false_series = _eval_mapping_formula(false_str.strip(), df)
+            return pd.Series(
+                [t if c else f for c, t, f in zip(condition, true_series, false_series)],
+                dtype=object,
+            )
+
+    # ROW([start]) — row index with optional arithmetic
+    # Examples: ROW()  ROW(1)  ROW()+1  ROW(1)**2  ROW()*2+1
+    m = re.match(r'^ROW\((\d*)\)\s*(.*)$', expr, re.IGNORECASE)
+    if m:
+        start = int(m.group(1)) if m.group(1) else 0
+        arithmetic = m.group(2).strip()
+        idx = np.arange(start, start + n, dtype=float)
+        if not arithmetic:
+            return pd.Series(idx.astype(int))
+        # Allow only safe arithmetic characters to avoid code injection
+        if re.match(r'^[\d\s\+\-\*\/\(\)\.\^%]+$', arithmetic):
+            arithmetic = arithmetic.replace('^', '**')  # accept ^ as power operator
+            try:
+                result_arr = eval(f"idx{arithmetic}", {"idx": idx, "__builtins__": {}})  # noqa: S307
+                return pd.Series(result_arr)
+            except Exception:
+                pass
+
+    # Concatenation with &  — split respecting quotes and parentheses
+    if "&" in expr:
+        amp_parts: list = []
+        _depth = 0
+        _in_q = False
+        _qc = ""
+        _cur: list = []
+        for _ch in expr:
+            if _ch in ('"', "'") and not _in_q:
+                _in_q, _qc = True, _ch
+                _cur.append(_ch)
+            elif _ch == _qc and _in_q:
+                _in_q = False
+                _cur.append(_ch)
+            elif _ch == "(" and not _in_q:
+                _depth += 1
+                _cur.append(_ch)
+            elif _ch == ")" and not _in_q:
+                _depth -= 1
+                _cur.append(_ch)
+            elif _ch == "&" and _depth == 0 and not _in_q:
+                amp_parts.append("".join(_cur).strip())
+                _cur = []
+            else:
+                _cur.append(_ch)
+        if _cur:
+            amp_parts.append("".join(_cur).strip())
+
+        if len(amp_parts) > 1:
+            result: pd.Series = pd.Series([""] * n, dtype=str)
+            for p in amp_parts:
+                part_val = _eval_mapping_formula(p, df)
+                result = result + part_val.fillna("").astype(str)
+            return result
+
+    # Arithmetic: additive (+, -) — checked before multiplicative for correct precedence
+    found_add = _rfind_op_at_depth0(expr, ("+", "-"))
+    if found_add:
+        op_a, l_a, r_a = found_add
+        lv = _eval_mapping_formula(l_a, df)
+        rv = _eval_mapping_formula(r_a, df)
+        if pd.api.types.is_datetime64_any_dtype(lv):
+            delta = pd.to_timedelta(pd.to_numeric(rv, errors="coerce").fillna(0), unit="D")
+            return (lv + delta if op_a == "+" else lv - delta).reset_index(drop=True)
+        ln = pd.to_numeric(lv, errors="coerce")
+        rn = pd.to_numeric(rv, errors="coerce")
+        return (ln + rn if op_a == "+" else ln - rn).reset_index(drop=True)
+
+    # Arithmetic: multiplicative (*, /)
+    found_mul = _rfind_op_at_depth0(expr, ("*", "/"))
+    if found_mul:
+        op_m, l_m, r_m = found_mul
+        ln_m = pd.to_numeric(_eval_mapping_formula(l_m, df), errors="coerce")
+        rn_m = pd.to_numeric(_eval_mapping_formula(r_m, df), errors="coerce")
+        if op_m == "*":
+            return (ln_m * rn_m).reset_index(drop=True)
+        return (ln_m / rn_m.replace(0, float("nan"))).reset_index(drop=True)
+
+    return empty
+
+
+def _apply_filters(df: pd.DataFrame, filters: list) -> pd.DataFrame:
+    """Apply row filters to a DataFrame, returning only matching rows."""
+    if not filters:
+        return df
+    mask = pd.Series([True] * len(df), index=df.index)
+    for f in filters:
+        if f.col not in df.columns:
+            continue
+        col = df[f.col]
+        op, val = f.op, f.val
+        try:
+            if op == "=":
+                try:
+                    mask &= pd.to_numeric(col, errors="raise") == float(val)
+                except Exception:
+                    mask &= col.astype(str).str.lower() == val.lower()
+            elif op == "<>":
+                try:
+                    mask &= pd.to_numeric(col, errors="raise") != float(val)
+                except Exception:
+                    mask &= col.astype(str).str.lower() != val.lower()
+            elif op == ">":
+                mask &= pd.to_numeric(col, errors="coerce") > float(val)
+            elif op == "<":
+                mask &= pd.to_numeric(col, errors="coerce") < float(val)
+            elif op == ">=":
+                mask &= pd.to_numeric(col, errors="coerce") >= float(val)
+            elif op == "<=":
+                mask &= pd.to_numeric(col, errors="coerce") <= float(val)
+            elif op == "contains":
+                mask &= col.astype(str).str.contains(val, case=False, na=False)
+            elif op == "not_contains":
+                mask &= ~col.astype(str).str.contains(val, case=False, na=False)
+            elif op == "starts_with":
+                mask &= col.astype(str).str.startswith(val, na=False)
+            elif op == "ends_with":
+                mask &= col.astype(str).str.endswith(val, na=False)
+            elif op == "is_empty":
+                mask &= col.isna() | (col.astype(str).str.strip() == "")
+            elif op == "is_not_empty":
+                mask &= col.notna() & (col.astype(str).str.strip() != "")
+        except Exception:
+            continue
+    return df[mask].reset_index(drop=True)
+
+
+def _run_mapping(df_src: pd.DataFrame, config: "MappingExecuteConfig") -> pd.DataFrame:
+    df_src = _apply_filters(df_src, config.filters)
+    out: Dict[str, pd.Series] = {}
+    pk_col: Optional[str] = None
+
+    # Build a combined DataFrame incrementally so later formulas can reference
+    # already-computed output columns (e.g. =test_2 reusing an earlier column).
+    # Output column names take precedence over source columns with the same name.
+    df_work = df_src.reset_index(drop=True).copy()
+
+    for col_def in config.columns:
+        formula = col_def.formula.strip()
+        if formula.startswith("="):
+            series = _eval_mapping_formula(formula[1:], df_work)
+        elif formula:
+            series = pd.Series([formula] * len(df_work))
+        else:
+            series = pd.Series([""] * len(df_work))
+        series = series.reset_index(drop=True)
+        # Always store raw (datetime-aware) in df_work for cross-column references
+        df_work[col_def.target_name] = series
+        # Only include in final output if include_in_output is True
+        if col_def.include_in_output:
+            # Apply format: convert datetime to user-friendly string
+            out_series = series
+            if pd.api.types.is_datetime64_any_dtype(series):
+                _fmt = (col_def.format or "").lower()
+                if _fmt == "date":
+                    out_series = series.dt.strftime("%d/%m/%Y")
+                elif _fmt == "datetime":
+                    out_series = series.dt.strftime("%d/%m/%Y %H:%M")
+                elif _fmt == "time":
+                    out_series = series.dt.strftime("%H:%M")
+                else:
+                    # Auto: if all times are midnight, render date only
+                    _no_time = (series.dt.hour == 0) & (series.dt.minute == 0) & (series.dt.second == 0)
+                    if _no_time.all():
+                        out_series = series.dt.strftime("%d/%m/%Y")
+            out[col_def.target_name] = out_series
+        if col_def.is_pk:
+            pk_col = col_def.target_name
+
+    df_out = pd.DataFrame(out)
+
+    if pk_col and pk_col in df_out.columns:
+        mask = df_out[pk_col].notna() & (df_out[pk_col].astype(str).str.strip() != "")
+        df_out = df_out[mask].reset_index(drop=True)
+
+    if config.dedup_by_pk and pk_col and pk_col in df_out.columns:
+        agg_map: Dict[str, Any] = {}
+        for col_def in config.columns:
+            t = col_def.target_name
+            if t == pk_col:
+                continue
+            a = col_def.aggregation.lower()
+            if a == "sum":       agg_map[t] = "sum"
+            elif a == "count":   agg_map[t] = "count"
+            elif a == "max":     agg_map[t] = "max"
+            elif a == "min":     agg_map[t] = "min"
+            elif a == "average": agg_map[t] = "mean"
+            elif a == "last":    agg_map[t] = "last"
+            elif a == "concat":  agg_map[t] = lambda x: "; ".join(str(v) for v in x if str(v) not in ("", "nan"))
+            else:                agg_map[t] = "first"
+        df_out = df_out.groupby(pk_col, sort=False).agg(agg_map).reset_index()
+
+    # Apply output filters (filter on computed output columns, after dedup)
+    if config.output_filters:
+        df_out = _apply_filters(df_out, config.output_filters)
+
+    return df_out
+
+
+@app.post("/api/mapping/columns")
+def mapping_get_columns(file: UploadFile = File(...)):
+    content = file.file.read()
+    try:
+        df = _read_df_from_bytes(content, file.filename or "")
+        return {"columns": list(df.columns), "row_count": len(df)}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot read file: {exc}")
+
+
+@app.post("/api/mapping/preview")
+def mapping_preview(
+    file: UploadFile = File(...),
+    config_json: str = Form(...),
+):
+    try:
+        config = MappingExecuteConfig(**json.loads(config_json))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid config: {exc}")
+
+    content = file.file.read()
+    try:
+        df_src = _read_df_from_bytes(content, file.filename or "")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot read file: {exc}")
+
+    df_out = _run_mapping(df_src, config)
+    total = len(df_out)
+    preview = df_out.head(100)
+
+    def _safe(v: Any) -> Any:
+        if isinstance(v, float) and (v != v):  # NaN
+            return None
+        try:
+            if pd.isna(v):
+                return None
+        except (TypeError, ValueError):
+            pass
+        if isinstance(v, (int, float, bool, str, type(None))):
+            return v
+        return str(v)
+
+    rows_json = [
+        {col: _safe(val) for col, val in row.items()}
+        for _, row in preview.iterrows()
+    ]
+    return {
+        "columns": list(df_out.columns),
+        "rows": rows_json,
+        "total_rows": total,
+        "preview_rows": len(rows_json),
+    }
+
+
+@app.post("/api/mapping/execute")
+def mapping_execute(
+    file: UploadFile = File(...),
+    config_json: str = Form(...),
+):
+    try:
+        config = MappingExecuteConfig(**json.loads(config_json))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid config: {exc}")
+
+    content = file.file.read()
+    try:
+        df_src = _read_df_from_bytes(content, file.filename or "")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot read file: {exc}")
+
+    df_out = _run_mapping(df_src, config)
+
+    buf = BytesIO()
+    if config.output_format == "excel":
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df_out.to_excel(writer, sheet_name="Output", index=False)
+        buf.seek(0)
+        return Response(
+            content=buf.read(),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{config.output_filename}"'},
+        )
+    df_out.to_csv(buf, index=False, encoding="utf-8-sig")
+    buf.seek(0)
+    return Response(
+        content=buf.read(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={config.output_filename}"},
+    )
 
 
 @app.get("/baglist")

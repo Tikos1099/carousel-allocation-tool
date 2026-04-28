@@ -21,4 +21,45 @@ export interface SupabaseJob {
     narrow_wide_pct?: number
   }
   storage_size_bytes: number
+  folder_id: string | null
+}
+
+export interface Folder {
+  id: string
+  name: string
+  created_at: string | null
+}
+
+export interface MappingRow {
+  id: string
+  targetName: string
+  sourceCol: string
+  formula: string
+  isPK: boolean
+  aggregation: string
+  format: string
+  includeInOutput: boolean
+}
+
+export type FilterOp =
+  | "=" | "<>" | ">" | "<" | ">=" | "<="
+  | "contains" | "not_contains"
+  | "starts_with" | "ends_with"
+  | "is_empty" | "is_not_empty"
+
+export interface FilterRule {
+  id: string
+  col: string
+  op: FilterOp
+  val: string
+}
+
+export interface MappingConfig {
+  id: string
+  name: string
+  rows: MappingRow[]
+  filters: FilterRule[]
+  output_filters: FilterRule[]
+  dedup_by_pk: boolean
+  created_at: string | null
 }

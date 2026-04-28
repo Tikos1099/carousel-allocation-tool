@@ -476,6 +476,17 @@ export async function deleteCustomKPI(kpiId: string): Promise<void> {
   }
 }
 
+export async function deleteJob(jobId: string): Promise<void> {
+  const res = await fetch(
+    buildUrl(`/api/jobs/${jobId}`),
+    withSessionHeaders({ method: "DELETE" })
+  )
+  if (!res.ok) {
+    const message = await parseError(res)
+    throw new Error(message)
+  }
+}
+
 export interface JobSummary {
   jobId: string
   scenarioName?: string

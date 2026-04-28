@@ -7,6 +7,7 @@ import { toast } from "sonner"
 import { getSessionState, runJob, setSessionState, type AllocationConfig } from "@/lib/api"
 import { AppShell } from "@/components/app-shell"
 import { WizardStepper } from "@/components/wizard/wizard-stepper"
+import { useI18n } from "@/lib/i18n"
 import { StepUpload } from "@/components/wizard/step-upload"
 import { StepColumnMapping } from "@/components/wizard/step-column-mapping"
 import { StepCategoryMapping } from "@/components/wizard/step-category-mapping"
@@ -69,19 +70,9 @@ const initialState: WizardState = {
   extrasByTerminal: {},
 }
 
-const steps = [
-  { id: 1, title: "Import", description: "Charger le fichier Excel" },
-  { id: 2, title: "Colonnes", description: "Mapper les colonnes" },
-  { id: 3, title: "Categories", description: "Configurer les mappings" },
-  { id: 4, title: "Make-Up", description: "Regles d'ouverture/fermeture" },
-  { id: 5, title: "Timeline", description: "Pas de temps" },
-  { id: 6, title: "Carousels", description: "Configuration carousels" },
-  { id: 7, title: "Extras", description: "Capacity sizing" },
-  { id: 8, title: "Execution", description: "Lancer l'allocation" },
-]
-
 export default function WizardPage() {
   const router = useRouter()
+  const { t } = useI18n()
   const [currentStep, setCurrentStep] = useState(1)
   const [state, setState] = useState<WizardState>(initialState)
   const [isRunning, setIsRunning] = useState(false)
@@ -143,7 +134,7 @@ export default function WizardPage() {
         }))
 
         if (session.currentStep) {
-          const bounded = Math.min(Math.max(session.currentStep, 1), steps.length)
+          const bounded = Math.min(Math.max(session.currentStep, 1), 8)
           setCurrentStep(bounded)
         }
       } finally {
@@ -187,7 +178,7 @@ export default function WizardPage() {
   }, [state, currentStep, isHydrated])
 
   const handleNext = () => {
-    if (currentStep < steps.length) {
+    if (currentStep < 8) {
       setCurrentStep(currentStep + 1)
     }
   }
@@ -202,7 +193,7 @@ export default function WizardPage() {
     if (!state.file && !state.fileMeta) return
 
     setIsRunning(true)
-    toast.info("Allocation en cours...", { duration: 2000 })
+    toast.info(t.wizard.toastRunning, { duration: 2000 })
 
     try {
       const config: AllocationConfig = {
@@ -221,14 +212,14 @@ export default function WizardPage() {
           ? (window.sessionStorage.getItem("carousel_scenario_name") ?? undefined)
           : undefined
       const { jobId } = await runJob(state.file, config, scenarioName)
-      
-      toast.success("Allocation terminee avec succes!", { duration: 3000 })
-      
+
+      toast.success(t.wizard.toastSuccess, { duration: 3000 })
+
       // Redirect to results
       router.push(`/results?jobId=${jobId}`)
     } catch (error) {
-      toast.error("Erreur lors de l'allocation", {
-        description: error instanceof Error ? error.message : "Erreur inconnue",
+      toast.error(t.wizard.toastError, {
+        description: error instanceof Error ? error.message : String(error),
       })
       setIsRunning(false)
     }
@@ -312,14 +303,14 @@ export default function WizardPage() {
     }
   }
 
+  const steps = t.wizard.steps.map((s, i) => ({ id: i + 1, ...s }))
+
   return (
     <AppShell>
       <div className="container mx-auto max-w-5xl px-4 py-8">
         <div className="mb-8">
-          <h1 className="text-2xl font-bold">Assistant d{"'"}Allocation</h1>
-          <p className="mt-1 text-muted-foreground">
-            Suivez les etapes pour configurer et executer votre allocation de carousels.
-          </p>
+          <h1 className="text-2xl font-bold">{t.wizard.title}</h1>
+          <p className="mt-1 text-muted-foreground">{t.wizard.subtitle}</p>
         </div>
 
         <WizardStepper steps={steps} currentStep={currentStep} />

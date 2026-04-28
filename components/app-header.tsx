@@ -2,22 +2,35 @@
 
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { BarChart3, Home, Layers, Play, Settings } from "lucide-react"
+import { BarChart3, BookOpen, Database, GitMerge, Home, Layers, Play, Settings } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { SidebarTrigger } from "@/components/ui/sidebar"
-
-const navigation = [
-  { name: "Accueil", href: "/", icon: Home },
-  { name: "Assistant", href: "/wizard", icon: Play },
-  { name: "Resultats", href: "/results", icon: Layers },
-  { name: "Analytics", href: "/analytics", icon: BarChart3 },
-]
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import { useI18n, LANGUAGES } from "@/lib/i18n"
 
 export function AppHeader() {
   const pathname = usePathname()
+  const { t, lang, setLang } = useI18n()
+
+  const navigation = [
+    { name: t.nav.home, href: "/", icon: Home },
+    { name: t.nav.wizard, href: "/wizard", icon: Play },
+    { name: t.nav.results, href: "/results", icon: Layers },
+    { name: t.nav.database, href: "/database", icon: Database },
+    { name: t.nav.analytics, href: "/analytics", icon: BarChart3 },
+    { name: "Mapping", href: "/mapping", icon: GitMerge },
+    { name: "Guide", href: "/help", icon: BookOpen },
+  ]
+
+  const currentLang = LANGUAGES.find((l) => l.code === lang)
 
   return (
     <header className="sticky top-0 z-50 flex h-14 items-center border-b bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60">
@@ -38,11 +51,12 @@ export function AppHeader() {
 
       <nav className="ml-8 hidden items-center gap-1 md:flex">
         {navigation.map((item) => {
-          const isActive = pathname === item.href || 
+          const isActive =
+            pathname === item.href ||
             (item.href !== "/" && pathname.startsWith(item.href))
           return (
             <Button
-              key={item.name}
+              key={item.href}
               variant="ghost"
               size="sm"
               asChild
@@ -61,9 +75,34 @@ export function AppHeader() {
       </nav>
 
       <div className="ml-auto flex items-center gap-2">
+        {/* Language switcher */}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="sm" className="gap-2 text-sm">
+              <span>{currentLang?.flag}</span>
+              <span className="hidden sm:inline">{currentLang?.nativeLabel}</span>
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-[140px]">
+            {LANGUAGES.map((language) => (
+              <DropdownMenuItem
+                key={language.code}
+                onClick={() => setLang(language.code)}
+                className={cn(
+                  "gap-2 cursor-pointer",
+                  lang === language.code && "font-medium bg-accent"
+                )}
+              >
+                <span>{language.flag}</span>
+                {language.nativeLabel}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+
         <Button variant="ghost" size="icon">
           <Settings className="h-4 w-4" />
-          <span className="sr-only">Parametres</span>
+          <span className="sr-only">{t.common.settings}</span>
         </Button>
       </div>
     </header>

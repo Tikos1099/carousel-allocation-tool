@@ -9,7 +9,9 @@
       "WebSearch",
       "WebFetch(domain:github.com)",
       "Bash(node -e \":*)",
-      "Bash(npm run:*)"
+      "Bash(npm run:*)",
+      "Bash(wc -l \"c:/Users/ASA/Desktop/perso/projects/carousel-allocation-tool/components/wizard/\"*.tsx \"c:/Users/ASA/Desktop/perso/projects/carousel-allocation-tool/components/job/\"*.tsx)",
+      "Bash(grep -E \"\\\\.\\(tsx?|json\\)$\")"
     ]
   }
 }

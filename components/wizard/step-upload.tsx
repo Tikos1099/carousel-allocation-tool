@@ -8,6 +8,7 @@ import { AlertCircle, ArrowRight, CheckCircle2, FileSpreadsheet, Upload } from "
 import { uploadFile } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import type { WizardState } from "@/app/wizard/page"
+import { useI18n } from "@/lib/i18n"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -20,6 +21,7 @@ interface StepUploadProps {
 }
 
 export function StepUpload({ state, updateState, onNext }: StepUploadProps) {
+  const { t } = useI18n()
   const [isDragging, setIsDragging] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
@@ -34,7 +36,7 @@ export function StepUpload({ state, updateState, onNext }: StepUploadProps) {
         "text/csv",
       ]
       if (!validTypes.includes(file.type) && !file.name.endsWith(".xlsx") && !file.name.endsWith(".xls") && !file.name.endsWith(".csv")) {
-        setError("Format de fichier non supporte. Utilisez Excel (.xlsx, .xls) ou CSV.")
+        setError(t.wizard.upload.errorFormat)
         return
       }
 
@@ -65,7 +67,7 @@ export function StepUpload({ state, updateState, onNext }: StepUploadProps) {
         const message =
           err instanceof Error
             ? err.message
-            : "Erreur lors du chargement du fichier."
+            : t.wizard.upload.errorLoad
         setError(message)
         clearInterval(progressInterval)
         setUploadProgress(0)
@@ -114,10 +116,8 @@ export function StepUpload({ state, updateState, onNext }: StepUploadProps) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Importer le fichier de vols</CardTitle>
-        <CardDescription>
-          Chargez votre fichier Excel ou CSV contenant les donnees de vols.
-        </CardDescription>
+        <CardTitle>{t.wizard.upload.title}</CardTitle>
+        <CardDescription>{t.wizard.upload.desc}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
         {/* Drop zone */}
@@ -150,7 +150,7 @@ export function StepUpload({ state, updateState, onNext }: StepUploadProps) {
               <div className="w-64">
                 <Progress value={uploadProgress} className="h-2" />
                 <p className="mt-2 text-center text-sm text-muted-foreground">
-                  Chargement en cours... {uploadProgress}%
+                  {t.wizard.upload.loading} {uploadProgress}%
                 </p>
               </div>
             </div>
@@ -162,11 +162,11 @@ export function StepUpload({ state, updateState, onNext }: StepUploadProps) {
               <div className="text-center">
                 <p className="font-medium">{state.file?.name || state.fileMeta?.name}</p>
                 <p className="text-sm text-muted-foreground">
-                  {formatFileSize(state.file?.size || state.fileMeta?.size || 0)} - {state.filePreview.length} lignes d{"'"}aperçu
+                  {formatFileSize(state.file?.size || state.fileMeta?.size || 0)} - {state.filePreview.length} {t.wizard.upload.previewLines}
                 </p>
               </div>
               <Button variant="outline" size="sm">
-                Changer de fichier
+                {t.wizard.upload.changeFile}
               </Button>
             </div>
           ) : (
@@ -175,13 +175,13 @@ export function StepUpload({ state, updateState, onNext }: StepUploadProps) {
                 <FileSpreadsheet className="h-8 w-8 text-muted-foreground" />
               </div>
               <div className="text-center">
-                <p className="font-medium">Glissez-deposez votre fichier ici</p>
+                <p className="font-medium">{t.wizard.upload.dropTitle}</p>
                 <p className="text-sm text-muted-foreground">
-                  ou cliquez pour parcourir
+                  {t.wizard.upload.dropSub}
                 </p>
               </div>
               <p className="text-xs text-muted-foreground">
-                Formats acceptes: Excel (.xlsx, .xls), CSV
+                {t.wizard.upload.formats}
               </p>
             </div>
           )}
