@@ -1,10 +1,11 @@
 "use client"
 
-import { useEffect, useState } from "react"
-import { useRouter } from "next/navigation"
+import { Suspense, useEffect, useState } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
 import { toast } from "sonner"
 
 import { getSessionState, runJob, setSessionState, type AllocationConfig } from "@/lib/api"
+import { supabase } from "@/lib/supabase"
 import { AppShell } from "@/components/app-shell"
 import { WizardStepper } from "@/components/wizard/wizard-stepper"
 import { useI18n } from "@/lib/i18n"
@@ -70,8 +71,14 @@ const initialState: WizardState = {
   extrasByTerminal: {},
 }
 
-export default function WizardPage() {
+export default function WizardPageWrapper() {
+  return <Suspense><WizardPage /></Suspense>
+}
+
+function WizardPage() {
   const router = useRouter()
+  const searchParams = useSearchParams()
+  const scenarioId = searchParams.get("scenarioId")
   const { t } = useI18n()
   const [currentStep, setCurrentStep] = useState(1)
   const [state, setState] = useState<WizardState>(initialState)
@@ -212,6 +219,25 @@ export default function WizardPage() {
           ? (window.sessionStorage.getItem("carousel_scenario_name") ?? undefined)
           : undefined
       const { jobId } = await runJob(state.file, config, scenarioName)
+
+      // If launched from a scenario, save the run to allocation_runs and navigate back
+      if (scenarioId) {
+        await supabase.from("allocation_runs").insert({
+          id: jobId,
+          scenario_id: scenarioId,
+          name: scenarioName || null,
+          status: "done",
+          config: config as unknown as Record<string, unknown>,
+          kpis: null,
+          analytics: null,
+          warnings: null,
+          storage_size_bytes: 0,
+          finished_at: new Date().toISOString(),
+        })
+        toast.success(t.wizard.toastSuccess, { duration: 3000 })
+        router.push(`/scenario/${scenarioId}/allocation`)
+        return
+      }
 
       toast.success(t.wizard.toastSuccess, { duration: 3000 })
 

@@ -2502,13 +2502,34 @@ class MappingFilterRule(BaseModel):
         extra = "ignore"
 
 
+class JoinConfig(BaseModel):
+    alias: str
+    on_primary: str
+    on_secondary: str
+
+    class Config:
+        extra = "ignore"
+
+
+class FilterGroup(BaseModel):
+    id: str = ""
+    op: Literal["AND", "OR"] = "AND"
+    rules: List[MappingFilterRule] = []
+
+    class Config:
+        extra = "ignore"
+
+
 class MappingExecuteConfig(BaseModel):
     columns: List[MappingColumnDef]
     filters: List[MappingFilterRule] = []
     output_filters: List[MappingFilterRule] = []
+    filter_groups: List[FilterGroup] = []
+    output_filter_groups: List[FilterGroup] = []
     dedup_by_pk: bool = False
     output_format: Literal["csv", "excel"] = "csv"
     output_filename: str = "mapping_output.csv"
+    joins: List[JoinConfig] = []
 
     class Config:
         extra = "ignore"
@@ -2695,7 +2716,19 @@ def _eval_condition(cond: str, df: pd.DataFrame) -> "pd.Series":
 
 
 def _eval_mapping_formula(expr: str, df: pd.DataFrame) -> pd.Series:
-    expr = expr.strip()
+    # Normalize semicolons used as argument separators (French/Belgian Excel)
+    # Preserves semicolons inside quoted strings
+    _norm: list = []; _in_q = False; _qc = ""
+    for _ch in expr:
+        if _ch in ('"', "'") and not _in_q:
+            _in_q = True; _qc = _ch; _norm.append(_ch)
+        elif _ch == _qc and _in_q:
+            _in_q = False; _norm.append(_ch)
+        elif _ch == ";" and not _in_q:
+            _norm.append(",")
+        else:
+            _norm.append(_ch)
+    expr = "".join(_norm).strip()
     n = len(df)
     empty: pd.Series = pd.Series([""] * n, dtype=object)
 
@@ -3022,6 +3055,221 @@ def _eval_mapping_formula(expr: str, df: pd.DataFrame) -> pd.Series:
             mins = mins + day_src * 1440
         return mins.reset_index(drop=True)
 
+    # TIMETOHOUR(time[, day]) — convert time to total hours
+    m = re.match(r'^TIMETOHOUR\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        t_src = _eval_mapping_formula(args[0].strip(), df)
+        if pd.api.types.is_timedelta64_dtype(t_src):
+            hrs = t_src.dt.total_seconds() / 3600
+        elif pd.api.types.is_numeric_dtype(t_src):
+            hrs = t_src % 1 * 24
+        else:
+            def _t2h(x):
+                try:
+                    if x is None: return float("nan")
+                    if hasattr(x, 'hour'): return x.hour + x.minute / 60 + getattr(x, 'second', 0) / 3600
+                    if hasattr(x, 'total_seconds'): return x.total_seconds() / 3600
+                    ts = pd.to_datetime(x, errors='coerce')
+                    return float("nan") if pd.isna(ts) else ts.hour + ts.minute / 60 + ts.second / 3600
+                except Exception: return float("nan")
+            hrs = t_src.apply(_t2h)
+        if len(args) >= 2:
+            day_src = pd.to_numeric(_eval_mapping_formula(args[1].strip(), df), errors="coerce").fillna(0)
+            hrs = hrs + day_src * 24
+        return hrs.reset_index(drop=True)
+
+    # TIMETOSEC(time[, day]) — convert time to total seconds
+    m = re.match(r'^TIMETOSEC\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        t_src = _eval_mapping_formula(args[0].strip(), df)
+        if pd.api.types.is_timedelta64_dtype(t_src):
+            secs = t_src.dt.total_seconds()
+        elif pd.api.types.is_numeric_dtype(t_src):
+            secs = t_src % 1 * 86400
+        else:
+            def _t2sec(x):
+                try:
+                    if x is None: return float("nan")
+                    if hasattr(x, 'hour'): return x.hour * 3600 + x.minute * 60 + getattr(x, 'second', 0)
+                    if hasattr(x, 'total_seconds'): return x.total_seconds()
+                    ts = pd.to_datetime(x, errors='coerce')
+                    return float("nan") if pd.isna(ts) else ts.hour * 3600 + ts.minute * 60 + ts.second
+                except Exception: return float("nan")
+            secs = t_src.apply(_t2sec)
+        if len(args) >= 2:
+            day_src = pd.to_numeric(_eval_mapping_formula(args[1].strip(), df), errors="coerce").fillna(0)
+            secs = secs + day_src * 86400
+        return secs.reset_index(drop=True)
+
+    # RAND() / ALEA() — random float [0, 1) per row
+    if re.match(r'^(?:RAND|ALEA)\(\)$', expr, re.IGNORECASE):
+        return pd.Series(np.random.random(n))
+
+    # RANDBETWEEN(min, max) / ALEA.ENTRE.BORNES(min, max) — random integer in [min, max]
+    m = re.match(r'^(?:RANDBETWEEN|ALEA\.ENTRE\.BORNES)\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) == 2:
+            lo = pd.to_numeric(_eval_mapping_formula(args[0].strip(), df), errors="coerce").fillna(0)
+            hi = pd.to_numeric(_eval_mapping_formula(args[1].strip(), df), errors="coerce").fillna(1)
+            return pd.Series([int(np.random.randint(int(a), int(b) + 1)) for a, b in zip(lo, hi)])
+
+    # MOD(value, divisor)
+    m = re.match(r'^MOD\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) == 2:
+            a = pd.to_numeric(_eval_mapping_formula(args[0].strip(), df), errors="coerce")
+            b = pd.to_numeric(_eval_mapping_formula(args[1].strip(), df), errors="coerce")
+            return (a % b).reset_index(drop=True)
+
+    # POWER(base, exp) / PUISSANCE(base, exp)
+    m = re.match(r'^(?:POWER|PUISSANCE)\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) == 2:
+            base = pd.to_numeric(_eval_mapping_formula(args[0].strip(), df), errors="coerce")
+            exp_ = pd.to_numeric(_eval_mapping_formula(args[1].strip(), df), errors="coerce")
+            return (base ** exp_).reset_index(drop=True)
+
+    # SQRT(value)
+    m = re.match(r'^SQRT\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        src = pd.to_numeric(_eval_mapping_formula(m.group(1).strip(), df), errors="coerce")
+        return np.sqrt(src).reset_index(drop=True)
+
+    # MIN(a, b, ...) — row-wise minimum across columns/values
+    m = re.match(r'^MIN\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        cols = [pd.to_numeric(_eval_mapping_formula(a.strip(), df), errors="coerce") for a in args]
+        return pd.concat(cols, axis=1).min(axis=1).reset_index(drop=True)
+
+    # MAX(a, b, ...) — row-wise maximum
+    m = re.match(r'^MAX\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        cols = [pd.to_numeric(_eval_mapping_formula(a.strip(), df), errors="coerce") for a in args]
+        return pd.concat(cols, axis=1).max(axis=1).reset_index(drop=True)
+
+    # SUM(a, b, ...) / SOMME(...) — row-wise sum (variadic)
+    m = re.match(r'^(?:SUM|SOMME)\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        cols = [pd.to_numeric(_eval_mapping_formula(a.strip(), df), errors="coerce").fillna(0) for a in args]
+        return pd.concat(cols, axis=1).sum(axis=1).reset_index(drop=True)
+
+    # AVERAGE(a, b, ...) / MOYENNE(...) — row-wise average
+    m = re.match(r'^(?:AVERAGE|MOYENNE)\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        cols = [pd.to_numeric(_eval_mapping_formula(a.strip(), df), errors="coerce") for a in args]
+        return pd.concat(cols, axis=1).mean(axis=1).reset_index(drop=True)
+
+    # IFNA(value, alt) — return alt if value is NaN/empty
+    m = re.match(r'^IFNA\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) == 2:
+            val_s = _eval_mapping_formula(args[0].strip(), df)
+            alt_s = _eval_mapping_formula(args[1].strip(), df)
+            mask = val_s.isna() | (val_s.astype(str).isin(["nan", "NaT", ""]))
+            return val_s.where(~mask, other=alt_s).reset_index(drop=True)
+
+    # IFS(cond1, val1, cond2, val2, ...) / SI.CONDITIONS(...) — cascaded IF, no ELSE
+    m = re.match(r'^(?:IFS|SI\.CONDITIONS)\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        result = pd.Series([""] * n, dtype=object)
+        filled = pd.Series([False] * n)
+        for i in range(0, len(args) - 1, 2):
+            cond_s = _eval_condition(args[i].strip(), df)
+            val_s = _eval_mapping_formula(args[i + 1].strip(), df)
+            apply_mask = cond_s & ~filled
+            result = result.where(~apply_mask, other=val_s)
+            filled = filled | apply_mask
+        return result.reset_index(drop=True)
+
+    # CHOOSE(index, val1, val2, ...) / CHOISIR(...) — pick value by 1-based index
+    m = re.match(r'^(?:CHOOSE|CHOISIR)\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) >= 2:
+            idx_s = pd.to_numeric(_eval_mapping_formula(args[0].strip(), df), errors="coerce")
+            options = [_eval_mapping_formula(a.strip(), df) for a in args[1:]]
+            result = pd.Series([""] * n, dtype=object)
+            for row_i, idx_val in enumerate(idx_s):
+                try:
+                    ii = int(idx_val) - 1  # 1-based → 0-based
+                    if 0 <= ii < len(options):
+                        result.iloc[row_i] = options[ii].iloc[row_i]
+                except Exception:
+                    pass
+            return result.reset_index(drop=True)
+
+    # MATCH(lookup, col[, 0]) / EQUIV(lookup, col[, 0])
+    # Returns 1-based row position of first match of lookup in col
+    m = re.match(r'^(?:MATCH|EQUIV)\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) >= 2:
+            lookup_s = _eval_mapping_formula(args[0].strip(), df).astype(str)
+            search_s = _eval_mapping_formula(args[1].strip(), df).astype(str)
+            search_list = search_s.tolist()
+            def _match_fn(val):
+                try: return search_list.index(val) + 1
+                except ValueError: return float("nan")
+            return lookup_s.apply(_match_fn).reset_index(drop=True)
+
+    # INDEX(col, row_num) — value of col at row_num (1-based constant or per-row)
+    m = re.match(r'^INDEX\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) == 2:
+            col_s = _eval_mapping_formula(args[0].strip(), df)
+            row_s = pd.to_numeric(_eval_mapping_formula(args[1].strip(), df), errors="coerce")
+            col_list = col_s.tolist()
+            def _index_fn(row_num):
+                try:
+                    ri = int(row_num) - 1
+                    return col_list[ri] if 0 <= ri < len(col_list) else float("nan")
+                except Exception: return float("nan")
+            return row_s.apply(_index_fn).reset_index(drop=True)
+
+    # VLOOKUP(lookup, key_col, result_col[, exact]) / RECHERCHEV(...)
+    # Within-dataframe lookup: find lookup in key_col, return value from result_col
+    m = re.match(r'^(?:VLOOKUP|RECHERCHEV)\((.+)\)$', expr, re.IGNORECASE)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) >= 3:
+            lookup_s = _eval_mapping_formula(args[0].strip(), df).astype(str)
+            key_s = _eval_mapping_formula(args[1].strip(), df).astype(str)
+            result_col_s = _eval_mapping_formula(args[2].strip(), df)
+            key_list = key_s.tolist()
+            result_list = result_col_s.tolist()
+            def _vlookup_fn(val):
+                try:
+                    idx = key_list.index(val)
+                    return result_list[idx]
+                except (ValueError, IndexError): return float("nan")
+            return lookup_s.apply(_vlookup_fn).reset_index(drop=True)
+
+    # LET(name1, val1, ..., nameN, valN, formula) — define named variables
+    # Example: LET(p, ALEA(), IF(p<0.5, "A", "B"))
+    # The last argument is the formula; preceding pairs define variables available in it.
+    m = re.match(r'^LET\((.+)\)$', expr, re.IGNORECASE | re.DOTALL)
+    if m:
+        args = _split_formula_args(m.group(1))
+        if len(args) >= 3 and len(args) % 2 == 1:
+            df_let = df.copy()
+            for i in range(0, len(args) - 1, 2):
+                var_name = args[i].strip().strip("\"'")
+                var_val = _eval_mapping_formula(args[i + 1].strip(), df_let)
+                df_let[var_name] = var_val.values
+            return _eval_mapping_formula(args[-1].strip(), df_let).reset_index(drop=True)
+
     # NOT(condition)
     m = re.match(r'^NOT\((.+)\)$', expr, re.IGNORECASE)
     if m:
@@ -3048,13 +3296,8 @@ def _eval_mapping_formula(expr: str, df: pd.DataFrame) -> pd.Series:
             result_str = result_str + src.fillna("").astype(str)
         return result_str.reset_index(drop=True)
 
-    # IF(condition, true_value, false_value)
-    # Examples:
-    #   IF(Terminal="T1", "T1", "Other")
-    #   IF(Weight>100, "Heavy", "Light")
-    #   IF(AND(Status="OK", Weight>50), "Good", "Bad")
-    #   IF(OR(Status="DELAYED", Status="CANCELLED"), "Issue", "OK")
-    m = re.match(r'^IF\((.+)\)$', expr, re.IGNORECASE)
+    # IF(condition, true_value, false_value) / SI(...)
+    m = re.match(r'^(?:IF|SI)\((.+)\)$', expr, re.IGNORECASE)
     if m:
         args = _split_formula_args(m.group(1))
         if len(args) == 3:
@@ -3146,54 +3389,98 @@ def _eval_mapping_formula(expr: str, df: pd.DataFrame) -> pd.Series:
     return empty
 
 
+def _get_filter_mask(df: pd.DataFrame, f: "MappingFilterRule") -> "pd.Series":
+    """Return a boolean mask for a single filter rule."""
+    if f.col not in df.columns:
+        return pd.Series([True] * len(df), index=df.index)
+    col = df[f.col]
+    op, val = f.op, f.val
+    try:
+        if op == "=":
+            try:
+                return pd.to_numeric(col, errors="raise") == float(val)
+            except Exception:
+                return col.astype(str).str.lower() == val.lower()
+        elif op == "<>":
+            try:
+                return pd.to_numeric(col, errors="raise") != float(val)
+            except Exception:
+                return col.astype(str).str.lower() != val.lower()
+        elif op == ">":
+            return pd.to_numeric(col, errors="coerce") > float(val)
+        elif op == "<":
+            return pd.to_numeric(col, errors="coerce") < float(val)
+        elif op == ">=":
+            return pd.to_numeric(col, errors="coerce") >= float(val)
+        elif op == "<=":
+            return pd.to_numeric(col, errors="coerce") <= float(val)
+        elif op == "contains":
+            return col.astype(str).str.contains(val, case=False, na=False)
+        elif op == "not_contains":
+            return ~col.astype(str).str.contains(val, case=False, na=False)
+        elif op == "starts_with":
+            return col.astype(str).str.startswith(val, na=False)
+        elif op == "ends_with":
+            return col.astype(str).str.endswith(val, na=False)
+        elif op == "is_empty":
+            return col.isna() | (col.astype(str).str.strip() == "")
+        elif op == "is_not_empty":
+            return col.notna() & (col.astype(str).str.strip() != "")
+    except Exception:
+        pass
+    return pd.Series([True] * len(df), index=df.index)
+
+
 def _apply_filters(df: pd.DataFrame, filters: list) -> pd.DataFrame:
-    """Apply row filters to a DataFrame, returning only matching rows."""
+    """Apply flat AND filter list (backward compat)."""
     if not filters:
         return df
     mask = pd.Series([True] * len(df), index=df.index)
     for f in filters:
-        if f.col not in df.columns:
-            continue
-        col = df[f.col]
-        op, val = f.op, f.val
-        try:
-            if op == "=":
-                try:
-                    mask &= pd.to_numeric(col, errors="raise") == float(val)
-                except Exception:
-                    mask &= col.astype(str).str.lower() == val.lower()
-            elif op == "<>":
-                try:
-                    mask &= pd.to_numeric(col, errors="raise") != float(val)
-                except Exception:
-                    mask &= col.astype(str).str.lower() != val.lower()
-            elif op == ">":
-                mask &= pd.to_numeric(col, errors="coerce") > float(val)
-            elif op == "<":
-                mask &= pd.to_numeric(col, errors="coerce") < float(val)
-            elif op == ">=":
-                mask &= pd.to_numeric(col, errors="coerce") >= float(val)
-            elif op == "<=":
-                mask &= pd.to_numeric(col, errors="coerce") <= float(val)
-            elif op == "contains":
-                mask &= col.astype(str).str.contains(val, case=False, na=False)
-            elif op == "not_contains":
-                mask &= ~col.astype(str).str.contains(val, case=False, na=False)
-            elif op == "starts_with":
-                mask &= col.astype(str).str.startswith(val, na=False)
-            elif op == "ends_with":
-                mask &= col.astype(str).str.endswith(val, na=False)
-            elif op == "is_empty":
-                mask &= col.isna() | (col.astype(str).str.strip() == "")
-            elif op == "is_not_empty":
-                mask &= col.notna() & (col.astype(str).str.strip() != "")
-        except Exception:
-            continue
+        mask &= _get_filter_mask(df, f)
     return df[mask].reset_index(drop=True)
 
 
-def _run_mapping(df_src: pd.DataFrame, config: "MappingExecuteConfig") -> pd.DataFrame:
-    df_src = _apply_filters(df_src, config.filters)
+def _apply_filter_groups(df: pd.DataFrame, groups: list) -> pd.DataFrame:
+    """Apply grouped filters: rules within a group combined by group.op (AND/OR),
+    groups themselves combined with AND."""
+    if not groups:
+        return df
+    mask = pd.Series([True] * len(df), index=df.index)
+    for group in groups:
+        if not group.rules:
+            continue
+        group_mask = _get_filter_mask(df, group.rules[0])
+        for rule in group.rules[1:]:
+            rule_mask = _get_filter_mask(df, rule)
+            if group.op == "OR":
+                group_mask = group_mask | rule_mask
+            else:
+                group_mask = group_mask & rule_mask
+        mask = mask & group_mask
+    return df[mask].reset_index(drop=True)
+
+
+def _run_mapping(df_src: pd.DataFrame, config: "MappingExecuteConfig", secondary_dfs: Optional[Dict[str, "pd.DataFrame"]] = None) -> pd.DataFrame:
+    if config.filter_groups:
+        df_src = _apply_filter_groups(df_src, config.filter_groups)
+    elif config.filters:
+        df_src = _apply_filters(df_src, config.filters)
+
+    # LEFT JOIN secondary files
+    if secondary_dfs:
+        for join in config.joins:
+            df_sec = secondary_dfs.get(join.alias)
+            if df_sec is None or join.on_primary not in df_src.columns or join.on_secondary not in df_sec.columns:
+                continue
+            df_sec_prefixed = df_sec.rename(columns={col: f"{join.alias}.{col}" for col in df_sec.columns})
+            join_key_prefixed = f"{join.alias}.{join.on_secondary}"
+            df_src = df_src.assign(**{join.on_primary: df_src[join.on_primary].astype(str)})
+            df_sec_prefixed = df_sec_prefixed.assign(**{join_key_prefixed: df_sec_prefixed[join_key_prefixed].astype(str)})
+            df_src = df_src.merge(df_sec_prefixed, left_on=join.on_primary, right_on=join_key_prefixed, how="left")
+            if join_key_prefixed in df_src.columns:
+                df_src = df_src.drop(columns=[join_key_prefixed])
+        df_src = df_src.reset_index(drop=True)
     out: Dict[str, pd.Series] = {}
     pk_col: Optional[str] = None
 
@@ -3258,7 +3545,9 @@ def _run_mapping(df_src: pd.DataFrame, config: "MappingExecuteConfig") -> pd.Dat
         df_out = df_out.groupby(pk_col, sort=False).agg(agg_map).reset_index()
 
     # Apply output filters (filter on computed output columns, after dedup)
-    if config.output_filters:
+    if config.output_filter_groups:
+        df_out = _apply_filter_groups(df_out, config.output_filter_groups)
+    elif config.output_filters:
         df_out = _apply_filters(df_out, config.output_filters)
 
     return df_out
@@ -3277,6 +3566,7 @@ def mapping_get_columns(file: UploadFile = File(...)):
 @app.post("/api/mapping/preview")
 def mapping_preview(
     file: UploadFile = File(...),
+    secondary_files: Optional[List[UploadFile]] = File(default=None),
     config_json: str = Form(...),
 ):
     try:
@@ -3290,7 +3580,15 @@ def mapping_preview(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Cannot read file: {exc}")
 
-    df_out = _run_mapping(df_src, config)
+    secondary_dfs: Dict[str, Any] = {}
+    for i, sec_file in enumerate(secondary_files or []):
+        if i < len(config.joins):
+            try:
+                secondary_dfs[config.joins[i].alias] = _read_df_from_bytes(sec_file.file.read(), sec_file.filename or "")
+            except Exception:
+                pass
+
+    df_out = _run_mapping(df_src, config, secondary_dfs)
     total = len(df_out)
     preview = df_out.head(100)
 
@@ -3321,6 +3619,7 @@ def mapping_preview(
 @app.post("/api/mapping/execute")
 def mapping_execute(
     file: UploadFile = File(...),
+    secondary_files: Optional[List[UploadFile]] = File(default=None),
     config_json: str = Form(...),
 ):
     try:
@@ -3334,7 +3633,15 @@ def mapping_execute(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Cannot read file: {exc}")
 
-    df_out = _run_mapping(df_src, config)
+    secondary_dfs: Dict[str, Any] = {}
+    for i, sec_file in enumerate(secondary_files or []):
+        if i < len(config.joins):
+            try:
+                secondary_dfs[config.joins[i].alias] = _read_df_from_bytes(sec_file.file.read(), sec_file.filename or "")
+            except Exception:
+                pass
+
+    df_out = _run_mapping(df_src, config, secondary_dfs)
 
     buf = BytesIO()
     if config.output_format == "excel":

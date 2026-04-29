@@ -2,109 +2,68 @@
 
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { BarChart3, BookOpen, Database, GitMerge, Home, Layers, Play, Settings } from "lucide-react"
-
+import { FolderOpen, HelpCircle, LayoutDashboard, Zap } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { SidebarTrigger } from "@/components/ui/sidebar"
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
-import { useI18n, LANGUAGES } from "@/lib/i18n"
+
+const NAV = [
+  { label: "Dashboard", href: "/analytics",  icon: LayoutDashboard },
+  { label: "Project",   href: "/",           icon: FolderOpen, matchRoot: true },
+  { label: "Usage",     href: "/results",    icon: Zap },
+  { label: "Help",      href: "/help",       icon: HelpCircle },
+]
 
 export function AppHeader() {
   const pathname = usePathname()
-  const { t, lang, setLang } = useI18n()
 
-  const navigation = [
-    { name: t.nav.home, href: "/", icon: Home },
-    { name: t.nav.wizard, href: "/wizard", icon: Play },
-    { name: t.nav.results, href: "/results", icon: Layers },
-    { name: t.nav.database, href: "/database", icon: Database },
-    { name: t.nav.analytics, href: "/analytics", icon: BarChart3 },
-    { name: "Mapping", href: "/mapping", icon: GitMerge },
-    { name: "Guide", href: "/help", icon: BookOpen },
-  ]
-
-  const currentLang = LANGUAGES.find((l) => l.code === lang)
+  function isActive(item: typeof NAV[0]) {
+    if (item.matchRoot) {
+      return pathname === "/" ||
+        pathname.startsWith("/entreprise") ||
+        pathname.startsWith("/secteur") ||
+        pathname.startsWith("/projet") ||
+        pathname.startsWith("/scenario") ||
+        pathname.startsWith("/wizard")
+    }
+    return pathname.startsWith(item.href)
+  }
 
   return (
-    <header className="sticky top-0 z-50 flex h-14 items-center border-b bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-      <div className="flex items-center gap-2">
-        <SidebarTrigger className="-ml-1" />
-        <div className="flex items-center gap-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <Layers className="h-4 w-4" />
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="font-semibold">MakeUp</span>
-            <Badge variant="outline" className="text-xs font-normal">
-              DEV
-            </Badge>
-          </div>
+    <header className="sticky top-0 z-50 flex h-16 w-full items-center gap-6 bg-white border-b border-border px-6 shadow-sm">
+      {/* Logo */}
+      <Link href="/" className="flex items-center gap-2.5 shrink-0">
+        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary">
+          <span className="text-white font-black text-[15px] tracking-tight">H</span>
         </div>
-      </div>
+        <div className="leading-none">
+          <p className="text-[13px] font-black tracking-tight text-foreground">HUB PERFORMANCE</p>
+          <p className="text-[9px] font-semibold tracking-[0.1em] text-muted-foreground mt-0.5">
+            AVIATION MANAGEMENT
+          </p>
+        </div>
+      </Link>
 
-      <nav className="ml-8 hidden items-center gap-1 md:flex">
-        {navigation.map((item) => {
-          const isActive =
-            pathname === item.href ||
-            (item.href !== "/" && pathname.startsWith(item.href))
+      {/* Nav */}
+      <nav className="hidden md:flex items-center gap-1">
+        {NAV.map(item => {
+          const active = isActive(item)
+          const Icon = item.icon
           return (
-            <Button
-              key={item.href}
-              variant="ghost"
-              size="sm"
-              asChild
+            <Link
+              key={item.label}
+              href={item.href}
               className={cn(
-                "gap-2",
-                isActive && "bg-accent text-accent-foreground"
+                "flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-sm font-medium transition-colors",
+                active
+                  ? "bg-primary text-white"
+                  : "text-muted-foreground hover:text-foreground hover:bg-gray-100"
               )}
             >
-              <Link href={item.href}>
-                <item.icon className="h-4 w-4" />
-                {item.name}
-              </Link>
-            </Button>
+              <Icon className="h-3.5 w-3.5 shrink-0" />
+              <span>{item.label}</span>
+            </Link>
           )
         })}
       </nav>
-
-      <div className="ml-auto flex items-center gap-2">
-        {/* Language switcher */}
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="sm" className="gap-2 text-sm">
-              <span>{currentLang?.flag}</span>
-              <span className="hidden sm:inline">{currentLang?.nativeLabel}</span>
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-[140px]">
-            {LANGUAGES.map((language) => (
-              <DropdownMenuItem
-                key={language.code}
-                onClick={() => setLang(language.code)}
-                className={cn(
-                  "gap-2 cursor-pointer",
-                  lang === language.code && "font-medium bg-accent"
-                )}
-              >
-                <span>{language.flag}</span>
-                {language.nativeLabel}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-
-        <Button variant="ghost" size="icon">
-          <Settings className="h-4 w-4" />
-          <span className="sr-only">{t.common.settings}</span>
-        </Button>
-      </div>
     </header>
   )
 }

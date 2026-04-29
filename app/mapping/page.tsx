@@ -1,12 +1,13 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import { Suspense, useState, useEffect, useRef } from "react"
+import { useSearchParams } from "next/navigation"
 import {
   Upload, Plus, Trash2, Save, FolderOpen, X,
   ArrowUp, ArrowDown, FileSpreadsheet, FileText,
   AlertCircle, CheckCircle, GitMerge,
   Download, Eye, EyeOff, HelpCircle, ChevronRight,
-  MoreHorizontal, ArrowRight, Filter,
+  MoreHorizontal, ArrowRight, Filter, Link2,
 } from "lucide-react"
 import { AppShell } from "@/components/app-shell"
 import { Button } from "@/components/ui/button"
@@ -32,9 +33,45 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { toast } from "sonner"
-import { supabase, type MappingConfig, type MappingRow, type FilterRule, type FilterOp } from "@/lib/supabase"
+import { supabase, type MappingConfig, type MappingRow, type FilterRule, type FilterOp, type JoinSavedConfig } from "@/lib/supabase"
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+
+interface SecondaryFile {
+  id: string
+  file: File | null
+  alias: string
+  columns: string[]
+  onPrimary: string
+  onSecondary: string
+  isLoading: boolean
+}
+
+interface FilterGroup {
+  id: string
+  op: "AND" | "OR"
+  rules: FilterRule[]
+}
+
+function toFilterGroups(data: unknown[]): FilterGroup[] {
+  if (!data?.length) return []
+  if ((data[0] as FilterGroup).rules !== undefined) {
+    return (data as FilterGroup[]).map(g => ({
+      ...g,
+      id: g.id || crypto.randomUUID(),
+      rules: g.rules.map(r => ({ ...r, id: r.id || crypto.randomUUID() })),
+    }))
+  }
+  return (data as FilterRule[]).map(r => ({
+    id: crypto.randomUUID(),
+    op: "AND" as const,
+    rules: [{ ...r, id: r.id || crypto.randomUUID() }],
+  }))
+}
+
+function newFilterGroup(col = "", op: "AND" | "OR" = "AND"): FilterGroup {
+  return { id: crypto.randomUUID(), op, rules: [newFilterRule(col)] }
+}
 
 type Aggregation = "First" | "Last" | "Sum" | "Count" | "Max" | "Min" | "Average" | "Concat"
 type ColFormat =
@@ -105,18 +142,24 @@ async function getMappingColumns(file: File): Promise<{ columns: string[]; row_c
   return res.json()
 }
 
-async function getMappingPreview(file: File, config: object): Promise<PreviewResult> {
+async function getMappingPreview(file: File, secondaryFiles: SecondaryFile[], config: object): Promise<PreviewResult> {
   const form = new FormData()
   form.append("file", file)
+  for (const sec of secondaryFiles) {
+    if (sec.file) form.append("secondary_files", sec.file)
+  }
   form.append("config_json", JSON.stringify(config))
   const res = await fetch(`${API_BASE}/api/mapping/preview`, { method: "POST", body: form })
   if (!res.ok) { const e = await res.json().catch(() => ({ detail: res.statusText })); throw new Error(e.detail) }
   return res.json()
 }
 
-async function downloadMapping(file: File, config: object): Promise<{ blob: Blob; filename: string }> {
+async function downloadMapping(file: File, secondaryFiles: SecondaryFile[], config: object): Promise<{ blob: Blob; filename: string }> {
   const form = new FormData()
   form.append("file", file)
+  for (const sec of secondaryFiles) {
+    if (sec.file) form.append("secondary_files", sec.file)
+  }
   form.append("config_json", JSON.stringify(config))
   const res = await fetch(`${API_BASE}/api/mapping/execute`, { method: "POST", body: form })
   if (!res.ok) { const e = await res.json().catch(() => ({ detail: res.statusText })); throw new Error(e.detail) }
@@ -205,13 +248,25 @@ function StepBadge({ n, label, done }: { n: number; label: string; done: boolean
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
-export default function MappingPage() {
+export default function MappingPageWrapper() {
+  return <Suspense><MappingPage /></Suspense>
+}
+
+function MappingPage() {
+  const searchParams = useSearchParams()
+  const scenarioId = searchParams.get("scenarioId")
+  const mappingId = searchParams.get("mappingId")
+
   // Source
   const [sourceFile, setSourceFile] = useState<File | null>(null)
   const [sourceColumns, setSourceColumns] = useState<string[]>([])
   const [sourceRowCount, setSourceRowCount] = useState<number | null>(null)
   const [isLoadingSource, setIsLoadingSource] = useState(false)
   const sourceInputRef = useRef<HTMLInputElement>(null)
+
+  // Secondary files (joins)
+  const [secondaryFiles, setSecondaryFiles] = useState<SecondaryFile[]>([])
+  const secondaryInputRefs = useRef<Map<string, HTMLInputElement>>(new Map())
 
   // Target
   const targetInputRef = useRef<HTMLInputElement>(null)
@@ -221,11 +276,11 @@ export default function MappingPage() {
   // Rows
   const [rows, setRows] = useState<MappingRow[]>([])
 
-  // Source filters
-  const [filters, setFilters] = useState<FilterRule[]>([])
+  // Source filter groups
+  const [filterGroups, setFilterGroups] = useState<FilterGroup[]>([])
 
-  // Output filters (applied after mapping on computed columns)
-  const [outputFilters, setOutputFilters] = useState<FilterRule[]>([])
+  // Output filter groups
+  const [outputFilterGroups, setOutputFilterGroups] = useState<FilterGroup[]>([])
 
   // Options
   const [dedupByPK, setDedupByPK] = useState(false)
@@ -252,7 +307,10 @@ export default function MappingPage() {
   const [isDeleting, setIsDeleting] = useState(false)
   const [isLoadingConfigs, setIsLoadingConfigs] = useState(false)
 
-  useEffect(() => { loadConfigs() }, [])
+  useEffect(() => {
+    loadConfigs()
+    if (mappingId) loadMappingFromScenario()
+  }, [mappingId])
 
   async function loadConfigs() {
     setIsLoadingConfigs(true)
@@ -268,6 +326,26 @@ export default function MappingPage() {
     } finally {
       setIsLoadingConfigs(false)
     }
+  }
+
+  async function loadMappingFromScenario() {
+    if (!mappingId) return
+    const { data, error } = await supabase.from("mappings").select("*").eq("id", mappingId).single()
+    if (error || !data) return
+    setRows(data.rows || [])
+    setFilterGroups(toFilterGroups(data.filters || []))
+    setOutputFilterGroups(toFilterGroups(data.output_filters || []))
+    setDedupByPK(data.dedup_by_pk || false)
+    setConfigName(data.name || "")
+    setSecondaryFiles((data.joins || []).map((j: JoinSavedConfig) => ({
+      id: crypto.randomUUID(),
+      file: null,
+      alias: j.alias,
+      columns: [],
+      onPrimary: j.on_primary,
+      onSecondary: j.on_secondary,
+      isLoading: false,
+    })))
   }
 
   // ── Source file ──────────────────────────────────────────────────────────
@@ -371,6 +449,7 @@ export default function MappingPage() {
     const ext = format === "excel" ? ".xlsx" : ".csv"
     const baseName = filename.trim() || "mapping_output"
     const finalName = baseName.endsWith(ext) ? baseName : `${baseName}${ext}`
+    const validJoins = secondaryFiles.filter(s => s.file && s.alias.trim() && s.onPrimary && s.onSecondary)
     return {
       columns: rows.map(r => ({
         target_name: r.targetName,
@@ -381,13 +460,34 @@ export default function MappingPage() {
         format: r.format,
         include_in_output: r.includeInOutput ?? true,
       })),
-      filters: filters.map(f => ({ col: f.col, op: f.op, val: f.val })),
-      output_filters: outputFilters.map(f => ({ col: f.col, op: f.op, val: f.val })),
+      filters: [],
+      output_filters: [],
+      filter_groups: filterGroups.map(g => ({
+        id: g.id, op: g.op,
+        rules: g.rules.map(r => ({ col: r.col, op: r.op, val: r.val })),
+      })),
+      output_filter_groups: outputFilterGroups.map(g => ({
+        id: g.id, op: g.op,
+        rules: g.rules.map(r => ({ col: r.col, op: r.op, val: r.val })),
+      })),
       dedup_by_pk: dedupByPK,
       output_format: format,
       output_filename: finalName,
+      joins: validJoins.map(s => ({
+        alias: s.alias.trim(),
+        on_primary: s.onPrimary,
+        on_secondary: s.onSecondary,
+      })),
     }
   }
+
+  // All columns available for mapping (primary + secondary prefixed by alias)
+  const allSourceColumns = [
+    ...sourceColumns,
+    ...secondaryFiles
+      .filter(s => s.alias.trim() && s.columns.length > 0)
+      .flatMap(s => s.columns.map(col => `${s.alias.trim()}.${col}`)),
+  ]
 
   async function handlePreview() {
     if (!sourceFile) { toast.error("Veuillez charger un fichier source"); return }
@@ -395,7 +495,8 @@ export default function MappingPage() {
     setIsPreviewing(true)
     try {
       const config = buildConfig(outputFormat, outputFilename)
-      const result = await getMappingPreview(sourceFile, config)
+      const validSecondary = secondaryFiles.filter(s => s.file && s.alias.trim() && s.onPrimary && s.onSecondary)
+      const result = await getMappingPreview(sourceFile, validSecondary, config)
       setPreviewData(result)
       setShowPreviewDialog(true)
     } catch (e: unknown) {
@@ -410,7 +511,8 @@ export default function MappingPage() {
     setIsDownloading(true)
     try {
       const config = buildConfig(outputFormat, outputFilename)
-      const { blob, filename } = await downloadMapping(sourceFile, config)
+      const validSecondary = secondaryFiles.filter(s => s.file && s.alias.trim() && s.onPrimary && s.onSecondary)
+      const { blob, filename } = await downloadMapping(sourceFile, validSecondary, config)
       const url = URL.createObjectURL(blob)
       const a = document.createElement("a")
       a.href = url
@@ -433,17 +535,33 @@ export default function MappingPage() {
     if (!name) return
     setIsSaving(true)
     try {
+      // If in scenario context, save to mappings table
+      const joinsToSave = secondaryFiles
+        .filter(s => s.alias.trim() && s.onPrimary && s.onSecondary)
+        .map(s => ({ alias: s.alias.trim(), on_primary: s.onPrimary, on_secondary: s.onSecondary }))
+
+      if (mappingId) {
+        const { error } = await supabase
+          .from("mappings")
+          .update({ rows, filters: filterGroups, output_filters: outputFilterGroups, dedup_by_pk: dedupByPK, joins: joinsToSave })
+          .eq("id", mappingId)
+        if (error) throw error
+        toast.success(`Mapping "${name}" sauvegardé`)
+        setShowSaveDialog(false)
+        return
+      }
+
       const existing = savedConfigs.find(c => c.name === name)
       if (existing) {
         const { error } = await supabase
           .from("mapping_configs")
-          .update({ rows, filters, output_filters: outputFilters, dedup_by_pk: dedupByPK })
+          .update({ rows, filters: filterGroups, output_filters: outputFilterGroups, dedup_by_pk: dedupByPK, joins: joinsToSave })
           .eq("id", existing.id)
         if (error) throw error
       } else {
         const { error } = await supabase
           .from("mapping_configs")
-          .insert({ name, rows, filters, output_filters: outputFilters, dedup_by_pk: dedupByPK })
+          .insert({ name, rows, filters: filterGroups, output_filters: outputFilterGroups, dedup_by_pk: dedupByPK, joins: joinsToSave })
         if (error) throw error
       }
       toast.success(`Configuration "${name}" sauvegardée`)
@@ -459,9 +577,18 @@ export default function MappingPage() {
 
   function handleLoadConfig(cfg: MappingConfig) {
     setRows(cfg.rows.map(r => ({ ...r, includeInOutput: r.includeInOutput ?? true, id: crypto.randomUUID() })))
-    setFilters((cfg.filters ?? []).map(f => ({ ...f, id: crypto.randomUUID() })))
-    setOutputFilters((cfg.output_filters ?? []).map(f => ({ ...f, id: crypto.randomUUID() })))
+    setFilterGroups(toFilterGroups(cfg.filters ?? []))
+    setOutputFilterGroups(toFilterGroups(cfg.output_filters ?? []))
     setDedupByPK(cfg.dedup_by_pk)
+    setSecondaryFiles((cfg.joins ?? []).map((j: JoinSavedConfig) => ({
+      id: crypto.randomUUID(),
+      file: null,
+      alias: j.alias,
+      columns: [],
+      onPrimary: j.on_primary,
+      onSecondary: j.on_secondary,
+      isLoading: false,
+    })))
     setShowLoadDialog(false)
     toast.success(`Configuration "${cfg.name}" chargée`)
   }
@@ -731,118 +858,272 @@ export default function MappingPage() {
           </div>
         </section>
 
-        {/* ── Row Filters ─────────────────────────────────────────────────── */}
-        <section className="space-y-3">
+        {/* ── Secondary files (joins) ─────────────────────────────────────── */}
+        <div className="space-y-2">
           <div className="flex items-center gap-2">
-            <Filter className="h-4 w-4 text-muted-foreground shrink-0" />
-            <h2 className="text-sm font-semibold">Filtres de lignes</h2>
-            {filters.length > 0 && (
-              <Badge variant="secondary" className="text-xs">{filters.length} actif{filters.length > 1 ? "s" : ""}</Badge>
+            <Link2 className="h-4 w-4 text-muted-foreground shrink-0" />
+            <h2 className="text-sm font-semibold">Fichiers secondaires (jointures)</h2>
+            {secondaryFiles.length > 0 && (
+              <Badge variant="secondary" className="text-xs">{secondaryFiles.length}</Badge>
             )}
             <Separator className="flex-1" />
             <Button
               variant="ghost" size="sm"
               className="h-7 px-2 text-xs gap-1 shrink-0"
-              onClick={() => setFilters(f => [...f, newFilterRule(sourceColumns[0] ?? "")])}
-              disabled={sourceColumns.length === 0}
+              disabled={!sourceFile}
+              onClick={() => setSecondaryFiles(f => [...f, {
+                id: crypto.randomUUID(),
+                file: null,
+                alias: `ref${f.length + 1}`,
+                columns: [],
+                onPrimary: sourceColumns[0] ?? "",
+                onSecondary: "",
+                isLoading: false,
+              }])}
+            >
+              <Plus className="h-3.5 w-3.5" />
+              Ajouter un fichier
+            </Button>
+          </div>
+
+          {secondaryFiles.length === 0 ? (
+            <p className="text-xs text-muted-foreground px-1">
+              Aucun fichier secondaire — chargez-en un pour enrichir votre source via une jointure.
+              {!sourceFile && " Chargez d'abord le fichier principal."}
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {secondaryFiles.map((sec) => (
+                <Card key={sec.id} className="border-dashed">
+                  <CardContent className="p-3 space-y-3">
+                    {/* Header row: alias + remove */}
+                    <div className="flex items-center gap-2">
+                      <Link2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                      <Input
+                        value={sec.alias}
+                        onChange={e => setSecondaryFiles(fs => fs.map(s =>
+                          s.id === sec.id ? { ...s, alias: e.target.value } : s
+                        ))}
+                        placeholder="Alias (ex: ref1)"
+                        className="h-7 text-xs font-mono w-36"
+                      />
+                      <span className="text-xs text-muted-foreground">— colonnes accessibles via <code className="bg-muted px-1 rounded">{sec.alias.trim() || "alias"}.NomColonne</code></span>
+                      <Button
+                        variant="ghost" size="icon"
+                        className="h-6 w-6 text-muted-foreground hover:text-destructive ml-auto shrink-0"
+                        onClick={() => setSecondaryFiles(fs => fs.filter(s => s.id !== sec.id))}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-3">
+                      {/* File upload */}
+                      <div>
+                        <input
+                          ref={el => { if (el) secondaryInputRefs.current.set(sec.id, el); else secondaryInputRefs.current.delete(sec.id) }}
+                          type="file"
+                          accept=".xlsx,.xls,.csv"
+                          className="hidden"
+                          onChange={async e => {
+                            const f = e.target.files?.[0]
+                            e.target.value = ""
+                            if (!f) return
+                            setSecondaryFiles(fs => fs.map(s => s.id === sec.id ? { ...s, isLoading: true, file: f, columns: [], onSecondary: "" } : s))
+                            try {
+                              const result = await getMappingColumns(f)
+                              setSecondaryFiles(fs => fs.map(s => s.id === sec.id ? {
+                                ...s, isLoading: false, columns: result.columns,
+                                onSecondary: result.columns[0] ?? "",
+                              } : s))
+                            } catch {
+                              setSecondaryFiles(fs => fs.map(s => s.id === sec.id ? { ...s, isLoading: false, file: null } : s))
+                              toast.error("Impossible de lire le fichier secondaire")
+                            }
+                          }}
+                        />
+                        {!sec.file ? (
+                          <div
+                            onClick={() => secondaryInputRefs.current.get(sec.id)?.click()}
+                            className="border border-dashed rounded p-3 text-center cursor-pointer hover:border-primary hover:bg-primary/5 transition-all h-full flex flex-col items-center justify-center gap-1"
+                          >
+                            <Upload className="h-4 w-4 text-muted-foreground" />
+                            <p className="text-xs text-muted-foreground">Charger fichier</p>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-2 p-2 bg-muted/60 rounded">
+                            <FileSpreadsheet className="h-4 w-4 text-primary shrink-0" />
+                            <div className="min-w-0 flex-1">
+                              <p className="text-xs font-medium truncate">{sec.file.name}</p>
+                              <p className="text-xs text-muted-foreground">{sec.columns.length} colonnes</p>
+                            </div>
+                            <Button variant="ghost" size="icon" className="h-5 w-5 shrink-0"
+                              onClick={() => setSecondaryFiles(fs => fs.map(s => s.id === sec.id ? { ...s, file: null, columns: [], onSecondary: "" } : s))}>
+                              <X className="h-3 w-3" />
+                            </Button>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Join key — primary side */}
+                      <div className="space-y-1">
+                        <p className="text-xs text-muted-foreground font-medium">Clé — fichier principal</p>
+                        <Select
+                          value={sec.onPrimary || "__none__"}
+                          onValueChange={v => setSecondaryFiles(fs => fs.map(s => s.id === sec.id ? { ...s, onPrimary: v === "__none__" ? "" : v } : s))}
+                        >
+                          <SelectTrigger className="h-7 text-xs">
+                            <SelectValue placeholder="(colonne)" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="__none__" className="italic text-muted-foreground">(choisir)</SelectItem>
+                            {sourceColumns.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      {/* Join key — secondary side */}
+                      <div className="space-y-1">
+                        <p className="text-xs text-muted-foreground font-medium">Clé — fichier secondaire</p>
+                        <Select
+                          value={sec.onSecondary || "__none__"}
+                          onValueChange={v => setSecondaryFiles(fs => fs.map(s => s.id === sec.id ? { ...s, onSecondary: v === "__none__" ? "" : v } : s))}
+                          disabled={sec.columns.length === 0}
+                        >
+                          <SelectTrigger className="h-7 text-xs">
+                            <SelectValue placeholder="(colonne)" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="__none__" className="italic text-muted-foreground">(choisir)</SelectItem>
+                            {sec.columns.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+
+                    {/* Validation warning */}
+                    {sec.file && sec.alias.trim() && (!sec.onPrimary || !sec.onSecondary) && (
+                      <p className="text-xs text-amber-500 flex items-center gap-1">
+                        <AlertCircle className="h-3 w-3" />
+                        Définissez les deux clés de jointure pour activer ce fichier.
+                      </p>
+                    )}
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Row Filters ─────────────────────────────────────────────────── */}
+        <section className="space-y-3">
+          <div className="flex items-center gap-2">
+            <Filter className="h-4 w-4 text-muted-foreground shrink-0" />
+            <h2 className="text-sm font-semibold">Filtres de lignes</h2>
+            {filterGroups.length > 0 && (
+              <Badge variant="secondary" className="text-xs">
+                {filterGroups.reduce((s, g) => s + g.rules.length, 0)} règle{filterGroups.reduce((s, g) => s + g.rules.length, 0) > 1 ? "s" : ""}
+              </Badge>
+            )}
+            <Separator className="flex-1" />
+            <Button
+              variant="ghost" size="sm"
+              className="h-7 px-2 text-xs gap-1 shrink-0"
+              onClick={() => setFilterGroups(gs => [...gs, newFilterGroup(allSourceColumns[0] ?? "")])}
+              disabled={allSourceColumns.length === 0}
             >
               <Plus className="h-3.5 w-3.5" />
               Ajouter un filtre
             </Button>
           </div>
 
-          {filters.length === 0 ? (
+          {filterGroups.length === 0 ? (
             <p className="text-xs text-muted-foreground px-1">
               Aucun filtre — toutes les lignes source seront traitées.
-              {sourceColumns.length === 0 && " Chargez d'abord un fichier source."}
+              {allSourceColumns.length === 0 && " Chargez d'abord un fichier source."}
             </p>
           ) : (
-            <Card>
-              <CardContent className="p-0">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b bg-muted/40 text-xs text-muted-foreground">
-                      <th className="px-3 py-2 text-left font-medium w-[200px]">Colonne</th>
-                      <th className="px-3 py-2 text-left font-medium w-[200px]">Condition</th>
-                      <th className="px-3 py-2 text-left font-medium">Valeur</th>
-                      <th className="px-3 py-2 w-8" />
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y">
-                    {filters.map((f, idx) => {
-                      const opDef = FILTER_OPS.find(o => o.value === f.op)
-                      return (
-                        <tr key={f.id} className="hover:bg-muted/20 transition-colors">
-                          <td className="px-3 py-1.5">
-                            <Select
-                              value={f.col || "__none__"}
-                              onValueChange={v => setFilters(fs => fs.map((r, i) =>
-                                i === idx ? { ...r, col: v === "__none__" ? "" : v } : r
-                              ))}
-                            >
-                              <SelectTrigger className="h-7 text-xs">
-                                <SelectValue placeholder="(colonne)" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="__none__" className="italic text-muted-foreground">(choisir)</SelectItem>
-                                {sourceColumns.map(c => (
-                                  <SelectItem key={c} value={c}>{c}</SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </td>
-                          <td className="px-3 py-1.5">
-                            <Select
-                              value={f.op}
-                              onValueChange={v => setFilters(fs => fs.map((r, i) =>
-                                i === idx ? { ...r, op: v as FilterOp, val: "" } : r
-                              ))}
-                            >
-                              <SelectTrigger className="h-7 text-xs">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                {FILTER_OPS.map(o => (
-                                  <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </td>
-                          <td className="px-3 py-1.5">
-                            {opDef?.noVal ? (
-                              <span className="text-xs text-muted-foreground italic px-2">—</span>
-                            ) : (
-                              <Input
-                                value={f.val}
-                                onChange={e => setFilters(fs => fs.map((r, i) =>
-                                  i === idx ? { ...r, val: e.target.value } : r
-                                ))}
-                                placeholder="valeur…"
-                                className="h-7 text-xs border-transparent bg-transparent hover:border-input focus:border-input px-2"
-                              />
-                            )}
-                          </td>
-                          <td className="px-2 py-1.5">
-                            <Button
-                              variant="ghost" size="icon"
-                              className="h-6 w-6 text-muted-foreground hover:text-destructive"
-                              onClick={() => setFilters(fs => fs.filter((_, i) => i !== idx))}
-                            >
-                              <X className="h-3 w-3" />
-                            </Button>
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-                <div className="px-3 py-2 border-t bg-muted/20">
-                  <p className="text-xs text-muted-foreground">
-                    Les filtres sont combinés avec <strong>ET</strong> — une ligne doit satisfaire <strong>toutes</strong> les conditions pour être incluse.
-                  </p>
+            <div className="space-y-1.5">
+              {filterGroups.map((group, gIdx) => (
+                <div key={group.id}>
+                  {gIdx > 0 && (
+                    <div className="flex items-center gap-2 py-0.5 px-1">
+                      <div className="h-px flex-1 bg-border" />
+                      <span className="text-[10px] font-bold text-muted-foreground tracking-widest">ET</span>
+                      <div className="h-px flex-1 bg-border" />
+                    </div>
+                  )}
+                  <Card className={group.op === "OR" ? "border-orange-200" : ""}>
+                    <div className="flex items-center gap-2 px-3 py-1.5 border-b bg-muted/30">
+                      <button
+                        onClick={() => setFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, op: g.op === "AND" ? "OR" : "AND" } : g))}
+                        className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-widest transition-colors ${
+                          group.op === "OR" ? "bg-orange-100 text-orange-700 hover:bg-orange-200" : "bg-blue-100 text-blue-700 hover:bg-blue-200"
+                        }`}
+                      >
+                        {group.op === "OR" ? "OU" : "ET"}
+                      </button>
+                      <span className="text-xs text-muted-foreground">entre ces {group.rules.length} condition{group.rules.length > 1 ? "s" : ""}</span>
+                      <div className="flex-1" />
+                      <Button variant="ghost" size="sm" className="h-6 px-2 text-xs gap-1"
+                        onClick={() => setFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, rules: [...g.rules, newFilterRule(allSourceColumns[0] ?? "")] } : g))}>
+                        <Plus className="h-3 w-3" />Condition
+                      </Button>
+                      <Button variant="ghost" size="icon" className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                        onClick={() => setFilterGroups(gs => gs.filter(g => g.id !== group.id))}>
+                        <X className="h-3 w-3" />
+                      </Button>
+                    </div>
+                    <CardContent className="p-0">
+                      <table className="w-full text-sm">
+                        <tbody className="divide-y">
+                          {group.rules.map((f) => {
+                            const opDef = FILTER_OPS.find(o => o.value === f.op)
+                            return (
+                              <tr key={f.id} className="hover:bg-muted/20 transition-colors">
+                                <td className="px-3 py-1.5 w-[200px]">
+                                  <Select value={f.col || "__none__"}
+                                    onValueChange={v => setFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, rules: g.rules.map(r => r.id === f.id ? { ...r, col: v === "__none__" ? "" : v } : r) } : g))}>
+                                    <SelectTrigger className="h-7 text-xs"><SelectValue placeholder="(colonne)" /></SelectTrigger>
+                                    <SelectContent>
+                                      <SelectItem value="__none__" className="italic text-muted-foreground">(choisir)</SelectItem>
+                                      {allSourceColumns.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+                                    </SelectContent>
+                                  </Select>
+                                </td>
+                                <td className="px-3 py-1.5 w-[200px]">
+                                  <Select value={f.op}
+                                    onValueChange={v => setFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, rules: g.rules.map(r => r.id === f.id ? { ...r, op: v as FilterOp, val: "" } : r) } : g))}>
+                                    <SelectTrigger className="h-7 text-xs"><SelectValue /></SelectTrigger>
+                                    <SelectContent>{FILTER_OPS.map(o => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}</SelectContent>
+                                  </Select>
+                                </td>
+                                <td className="px-3 py-1.5">
+                                  {opDef?.noVal ? <span className="text-xs text-muted-foreground italic px-2">—</span> : (
+                                    <Input value={f.val}
+                                      onChange={e => setFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, rules: g.rules.map(r => r.id === f.id ? { ...r, val: e.target.value } : r) } : g))}
+                                      placeholder="valeur…" className="h-7 text-xs border-transparent bg-transparent hover:border-input focus:border-input px-2" />
+                                  )}
+                                </td>
+                                <td className="px-2 py-1.5">
+                                  <Button variant="ghost" size="icon" className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                                    onClick={() => setFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, rules: g.rules.filter(r => r.id !== f.id) } : g).filter(g => g.rules.length > 0))}>
+                                    <X className="h-3 w-3" />
+                                  </Button>
+                                </td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </CardContent>
+                  </Card>
                 </div>
-              </CardContent>
-            </Card>
+              ))}
+              <p className="text-xs text-muted-foreground px-1 pt-1">
+                Les groupes sont combinés avec <strong>ET</strong>. Le badge <strong>ET/OU</strong> s&apos;applique entre les conditions du groupe.
+              </p>
+            </div>
           )}
         </section>
 
@@ -851,8 +1132,10 @@ export default function MappingPage() {
           <div className="flex items-center gap-2">
             <Filter className="h-4 w-4 text-primary shrink-0" />
             <h2 className="text-sm font-semibold">Filtres sur l&apos;output</h2>
-            {outputFilters.length > 0 && (
-              <Badge variant="secondary" className="text-xs">{outputFilters.length} actif{outputFilters.length > 1 ? "s" : ""}</Badge>
+            {outputFilterGroups.length > 0 && (
+              <Badge variant="secondary" className="text-xs">
+                {outputFilterGroups.reduce((s, g) => s + g.rules.length, 0)} règle{outputFilterGroups.reduce((s, g) => s + g.rules.length, 0) > 1 ? "s" : ""}
+              </Badge>
             )}
             <Separator className="flex-1" />
             <Button
@@ -860,7 +1143,7 @@ export default function MappingPage() {
               className="h-7 px-2 text-xs gap-1 shrink-0"
               onClick={() => {
                 const firstCol = rows.find(r => r.targetName.trim())?.targetName ?? ""
-                setOutputFilters(f => [...f, newFilterRule(firstCol)])
+                setOutputFilterGroups(gs => [...gs, newFilterGroup(firstCol)])
               }}
               disabled={rows.length === 0}
             >
@@ -869,100 +1152,97 @@ export default function MappingPage() {
             </Button>
           </div>
 
-          {outputFilters.length === 0 ? (
+          {outputFilterGroups.length === 0 ? (
             <p className="text-xs text-muted-foreground px-1">
               Aucun filtre output — toutes les lignes calculées seront conservées.
               {rows.length === 0 && " Définissez d'abord les colonnes cibles (étape 2)."}
             </p>
           ) : (
-            <Card>
-              <CardContent className="p-0">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b bg-muted/40 text-xs text-muted-foreground">
-                      <th className="px-3 py-2 text-left font-medium w-[200px]">Colonne output</th>
-                      <th className="px-3 py-2 text-left font-medium w-[200px]">Condition</th>
-                      <th className="px-3 py-2 text-left font-medium">Valeur</th>
-                      <th className="px-3 py-2 w-8" />
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y">
-                    {outputFilters.map((f, idx) => {
-                      const opDef = FILTER_OPS.find(o => o.value === f.op)
-                      const outputCols = rows.map(r => r.targetName).filter(n => n.trim())
-                      return (
-                        <tr key={f.id} className="hover:bg-muted/20 transition-colors">
-                          <td className="px-3 py-1.5">
-                            <Select
-                              value={f.col || "__none__"}
-                              onValueChange={v => setOutputFilters(fs => fs.map((r, i) =>
-                                i === idx ? { ...r, col: v === "__none__" ? "" : v } : r
-                              ))}
-                            >
-                              <SelectTrigger className="h-7 text-xs">
-                                <SelectValue placeholder="(colonne)" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="__none__" className="italic text-muted-foreground">(choisir)</SelectItem>
-                                {outputCols.map(c => (
-                                  <SelectItem key={c} value={c}>{c}</SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </td>
-                          <td className="px-3 py-1.5">
-                            <Select
-                              value={f.op}
-                              onValueChange={v => setOutputFilters(fs => fs.map((r, i) =>
-                                i === idx ? { ...r, op: v as FilterOp, val: "" } : r
-                              ))}
-                            >
-                              <SelectTrigger className="h-7 text-xs">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                {FILTER_OPS.map(o => (
-                                  <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </td>
-                          <td className="px-3 py-1.5">
-                            {opDef?.noVal ? (
-                              <span className="text-xs text-muted-foreground italic px-2">—</span>
-                            ) : (
-                              <Input
-                                value={f.val}
-                                onChange={e => setOutputFilters(fs => fs.map((r, i) =>
-                                  i === idx ? { ...r, val: e.target.value } : r
-                                ))}
-                                placeholder="valeur…"
-                                className="h-7 text-xs border-transparent bg-transparent hover:border-input focus:border-input px-2"
-                              />
-                            )}
-                          </td>
-                          <td className="px-2 py-1.5">
-                            <Button
-                              variant="ghost" size="icon"
-                              className="h-6 w-6 text-muted-foreground hover:text-destructive"
-                              onClick={() => setOutputFilters(fs => fs.filter((_, i) => i !== idx))}
-                            >
-                              <X className="h-3 w-3" />
-                            </Button>
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-                <div className="px-3 py-2 border-t bg-muted/20">
-                  <p className="text-xs text-muted-foreground">
-                    Appliqués <strong>après</strong> le mapping et la déduplication — filtrent sur les valeurs calculées.
-                    Combinés avec <strong>ET</strong>.
-                  </p>
-                </div>
-              </CardContent>
-            </Card>
+            <div className="space-y-1.5">
+              {outputFilterGroups.map((group, gIdx) => {
+                const outputCols = rows.map(r => r.targetName).filter(n => n.trim())
+                return (
+                  <div key={group.id}>
+                    {gIdx > 0 && (
+                      <div className="flex items-center gap-2 py-0.5 px-1">
+                        <div className="h-px flex-1 bg-border" />
+                        <span className="text-[10px] font-bold text-muted-foreground tracking-widest">ET</span>
+                        <div className="h-px flex-1 bg-border" />
+                      </div>
+                    )}
+                    <Card className={group.op === "OR" ? "border-orange-200" : ""}>
+                      <div className="flex items-center gap-2 px-3 py-1.5 border-b bg-muted/30">
+                        <button
+                          onClick={() => setOutputFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, op: g.op === "AND" ? "OR" : "AND" } : g))}
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-widest transition-colors ${
+                            group.op === "OR" ? "bg-orange-100 text-orange-700 hover:bg-orange-200" : "bg-blue-100 text-blue-700 hover:bg-blue-200"
+                          }`}
+                        >
+                          {group.op === "OR" ? "OU" : "ET"}
+                        </button>
+                        <span className="text-xs text-muted-foreground">entre ces {group.rules.length} condition{group.rules.length > 1 ? "s" : ""}</span>
+                        <div className="flex-1" />
+                        <Button variant="ghost" size="sm" className="h-6 px-2 text-xs gap-1"
+                          onClick={() => setOutputFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, rules: [...g.rules, newFilterRule(outputCols[0] ?? "")] } : g))}>
+                          <Plus className="h-3 w-3" />Condition
+                        </Button>
+                        <Button variant="ghost" size="icon" className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                          onClick={() => setOutputFilterGroups(gs => gs.filter(g => g.id !== group.id))}>
+                          <X className="h-3 w-3" />
+                        </Button>
+                      </div>
+                      <CardContent className="p-0">
+                        <table className="w-full text-sm">
+                          <tbody className="divide-y">
+                            {group.rules.map((f) => {
+                              const opDef = FILTER_OPS.find(o => o.value === f.op)
+                              return (
+                                <tr key={f.id} className="hover:bg-muted/20 transition-colors">
+                                  <td className="px-3 py-1.5 w-[200px]">
+                                    <Select value={f.col || "__none__"}
+                                      onValueChange={v => setOutputFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, rules: g.rules.map(r => r.id === f.id ? { ...r, col: v === "__none__" ? "" : v } : r) } : g))}>
+                                      <SelectTrigger className="h-7 text-xs"><SelectValue placeholder="(colonne)" /></SelectTrigger>
+                                      <SelectContent>
+                                        <SelectItem value="__none__" className="italic text-muted-foreground">(choisir)</SelectItem>
+                                        {outputCols.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+                                      </SelectContent>
+                                    </Select>
+                                  </td>
+                                  <td className="px-3 py-1.5 w-[200px]">
+                                    <Select value={f.op}
+                                      onValueChange={v => setOutputFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, rules: g.rules.map(r => r.id === f.id ? { ...r, op: v as FilterOp, val: "" } : r) } : g))}>
+                                      <SelectTrigger className="h-7 text-xs"><SelectValue /></SelectTrigger>
+                                      <SelectContent>{FILTER_OPS.map(o => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}</SelectContent>
+                                    </Select>
+                                  </td>
+                                  <td className="px-3 py-1.5">
+                                    {opDef?.noVal ? <span className="text-xs text-muted-foreground italic px-2">—</span> : (
+                                      <Input value={f.val}
+                                        onChange={e => setOutputFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, rules: g.rules.map(r => r.id === f.id ? { ...r, val: e.target.value } : r) } : g))}
+                                        placeholder="valeur…" className="h-7 text-xs border-transparent bg-transparent hover:border-input focus:border-input px-2" />
+                                    )}
+                                  </td>
+                                  <td className="px-2 py-1.5">
+                                    <Button variant="ghost" size="icon" className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                                      onClick={() => setOutputFilterGroups(gs => gs.map(g => g.id === group.id ? { ...g, rules: g.rules.filter(r => r.id !== f.id) } : g).filter(g => g.rules.length > 0))}>
+                                      <X className="h-3 w-3" />
+                                    </Button>
+                                  </td>
+                                </tr>
+                              )
+                            })}
+                          </tbody>
+                        </table>
+                      </CardContent>
+                    </Card>
+                  </div>
+                )
+              })}
+              <p className="text-xs text-muted-foreground px-1 pt-1">
+                Appliqués <strong>après</strong> le mapping et la déduplication — filtrent sur les valeurs calculées.
+                Les groupes sont combinés avec <strong>ET</strong>.
+              </p>
+            </div>
           )}
         </section>
 
@@ -1063,7 +1343,7 @@ export default function MappingPage() {
                               </SelectTrigger>
                               <SelectContent>
                                 <SelectItem value="__none__" className="text-muted-foreground italic">(aucune)</SelectItem>
-                                {sourceColumns.map(col => (
+                                {allSourceColumns.map(col => (
                                   <SelectItem key={col} value={col}>{col}</SelectItem>
                                 ))}
                               </SelectContent>
@@ -1171,7 +1451,10 @@ export default function MappingPage() {
                   ? (() => {
                       const included = rows.filter(r => r.includeInOutput).length
                       const hidden = rows.length - included
-                      return `Prêt · ${included} colonne${included > 1 ? "s" : ""}${hidden > 0 ? ` (+${hidden} intermédiaire${hidden > 1 ? "s" : ""})` : ""} · ${sourceRowCount?.toLocaleString() ?? "?"} lignes source${filters.length > 0 ? ` · ${filters.length} filtre source` : ""}${outputFilters.length > 0 ? ` · ${outputFilters.length} filtre output` : ""}`
+                      const validJoins = secondaryFiles.filter(s => s.file && s.alias.trim() && s.onPrimary && s.onSecondary)
+                      const srcRules = filterGroups.reduce((s, g) => s + g.rules.length, 0)
+                      const outRules = outputFilterGroups.reduce((s, g) => s + g.rules.length, 0)
+                      return `Prêt · ${included} colonne${included > 1 ? "s" : ""}${hidden > 0 ? ` (+${hidden} intermédiaire${hidden > 1 ? "s" : ""})` : ""} · ${sourceRowCount?.toLocaleString() ?? "?"} lignes source${validJoins.length > 0 ? ` · ${validJoins.length} jointure${validJoins.length > 1 ? "s" : ""}` : ""}${srcRules > 0 ? ` · ${srcRules} filtre source` : ""}${outRules > 0 ? ` · ${outRules} filtre output` : ""}`
                     })()
                   : "Complétez les étapes 1 et 2 pour continuer"
                 }

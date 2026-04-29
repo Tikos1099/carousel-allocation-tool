@@ -11,7 +11,26 @@
       "Bash(node -e \":*)",
       "Bash(npm run:*)",
       "Bash(wc -l \"c:/Users/ASA/Desktop/perso/projects/carousel-allocation-tool/components/wizard/\"*.tsx \"c:/Users/ASA/Desktop/perso/projects/carousel-allocation-tool/components/job/\"*.tsx)",
-      "Bash(grep -E \"\\\\.\\(tsx?|json\\)$\")"
+      "Bash(grep -E \"\\\\.\\(tsx?|json\\)$\")",
+      "Bash(cat vercel.json)",
+      "Bash(cat .vercelrc)",
+      "Bash(git fetch *)",
+      "Bash(git ls-tree *)",
+      "Bash(node -e \"console.log\\(process.version\\)\")",
+      "Bash(mkdir -p \"c:\\\\Users\\\\ASA\\\\Desktop\\\\perso\\\\projects\\\\carousel-allocation-tool\\\\app\\\\projet\\\\[projetId]\")",
+      "Bash(mkdir -p \"c:\\\\Users\\\\ASA\\\\Desktop\\\\perso\\\\projects\\\\carousel-allocation-tool\\\\app\\\\scenario\\\\[scenarioId]\\\\allocation\")",
+      "Bash(mkdir -p \"c:\\\\Users\\\\ASA\\\\Desktop\\\\perso\\\\projects\\\\carousel-allocation-tool\\\\app\\\\scenario\\\\[scenarioId]\\\\mapping\\\\[mappingId]\")",
+      "Bash(mkdir -p \"c:\\\\Users\\\\ASA\\\\Desktop\\\\perso\\\\projects\\\\carousel-allocation-tool\\\\app\\\\scenario\\\\[scenarioId]\\\\analyse\")",
+      "Bash(python -m py_compile api_app.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('api_app.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"compile\\(open\\('api_app.py'\\).read\\(\\), 'api_app.py', 'exec'\\); print\\('SYNTAX OK'\\)\")",
+      "Bash(python -c \"compile\\(open\\('api_app.py', encoding='utf-8-sig'\\).read\\(\\), 'api_app.py', 'exec'\\); print\\('SYNTAX OK'\\)\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\ASA\\Desktop\\perso\\projects\\carousel-allocation-tool\\app\\projet\\[projetId]",
+      "c:\\Users\\ASA\\Desktop\\perso\\projects\\carousel-allocation-tool\\app\\entreprise",
+      "c:\\Users\\ASA\\Desktop\\perso\\projects\\carousel-allocation-tool\\app\\secteur",
+      "C:\\Users\\ASA\\Downloads"
     ]
   }
 }

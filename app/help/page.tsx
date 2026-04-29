@@ -5,7 +5,7 @@ import {
   AlertCircle, ArrowRight, BookOpen, CheckCircle, ChevronRight,
   Code, Database, Download, Eye, EyeOff, FileSpreadsheet, FileText,
   Filter, FolderOpen, GitMerge, HelpCircle, Info,
-  Layers, Plane, Play, Plus, Save, Trash2, Upload,
+  Layers, Link2, Plane, Play, Plus, Save, Trash2, Upload,
   Zap,
 } from "lucide-react"
 import Link from "next/link"
@@ -67,6 +67,8 @@ const TOC = [
   { id: "allocation", label: "Outil Allocation Make-Up" },
   { id: "mapping", label: "Mapping Tool" },
   { id: "mapping-source", label: "  → Fichier source" },
+  { id: "mapping-joins", label: "  → Fichiers secondaires (JOIN)" },
+  { id: "mapping-filters", label: "  → Filtres ET / OU" },
   { id: "mapping-target", label: "  → Schéma cible" },
   { id: "mapping-table", label: "  → Tableau de mapping" },
   { id: "mapping-formulas", label: "  → Formules — références" },
@@ -77,6 +79,7 @@ const TOC = [
   { id: "mapping-if", label: "  → IF / AND / OR / NOT" },
   { id: "mapping-row", label: "  → Séquences ROW()" },
   { id: "mapping-advanced", label: "  → Fonctions avancées" },
+  { id: "mapping-excel", label: "  → LET · IFS · MATCH · VLOOKUP…" },
   { id: "mapping-crosscol", label: "  → Colonnes intermédiaires" },
   { id: "mapping-dedup", label: "  → Dédupliquer par PK" },
   { id: "mapping-configs", label: "  → Configurations" },
@@ -275,6 +278,138 @@ export default function HelpPage() {
                 </div>
               </div>
 
+              {/* Secondary files / Joins */}
+              <div className="mt-8">
+                <SectionAnchor id="mapping-joins" />
+                <h3 className="font-semibold text-base mb-3 flex items-center gap-2">
+                  <Link2 className="h-4 w-4 text-muted-foreground" />
+                  Fichiers secondaires — JOIN
+                </h3>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Vous pouvez enrichir votre fichier principal avec des données venant d&apos;un ou plusieurs autres fichiers, comme un <strong>VLOOKUP</strong> ou un <strong>LEFT JOIN SQL</strong>.
+                  Les colonnes du fichier secondaire deviennent accessibles dans toutes vos formules.
+                </p>
+
+                <div className="space-y-4">
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="p-3 rounded-lg border bg-card">
+                      <p className="text-xs font-semibold mb-1">Alias</p>
+                      <p className="text-xs text-muted-foreground">Nom court sans espace donné au fichier secondaire (ex : <code className="bg-muted px-1 rounded">schedule</code>, <code className="bg-muted px-1 rounded">ref1</code>). Utilisé pour préfixer ses colonnes.</p>
+                    </div>
+                    <div className="p-3 rounded-lg border bg-card">
+                      <p className="text-xs font-semibold mb-1">Clé principale</p>
+                      <p className="text-xs text-muted-foreground">La colonne du <strong>fichier principal</strong> servant de clé de jointure (ex : <code className="bg-muted px-1 rounded">DepFlightId</code>).</p>
+                    </div>
+                    <div className="p-3 rounded-lg border bg-card">
+                      <p className="text-xs font-semibold mb-1">Clé secondaire</p>
+                      <p className="text-xs text-muted-foreground">La colonne correspondante dans le <strong>fichier secondaire</strong> (ex : <code className="bg-muted px-1 rounded">FlightId</code>).</p>
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Accéder aux colonnes dans les formules</p>
+                    <p className="text-sm text-muted-foreground mb-2">
+                      Après configuration, toutes les colonnes du fichier secondaire sont disponibles sous la forme <code className="bg-muted px-1.5 py-0.5 rounded text-xs font-mono">alias.NomColonne</code> dans le dropdown Source et dans les formules.
+                    </p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula="=schedule.ArrTime" result="Copie la colonne ArrTime du fichier « schedule »" />
+                      <FormulaRow formula={'=IF(schedule.ArrTime <> "", schedule.ArrTime, "N/A")'} result="ArrTime si dispo, sinon N/A" />
+                      <FormulaRow formula="=ref1.Gate & &quot;-&quot; & Terminal" result="Concaténation colonne secondaire + principale" />
+                      <FormulaRow formula={'=IF(ref1.Status = "OK", GateSecondary, GatePrimary)'} result="Condition croisant les deux sources" />
+                    </div>
+                  </div>
+
+                  <Callout icon={Info} color="bg-blue-50 border-blue-200 dark:bg-blue-950/20 dark:border-blue-800 text-blue-800 dark:text-blue-300"
+                    title="Comportement JOIN">
+                    C&apos;est un <strong>LEFT JOIN</strong> : toutes les lignes du fichier principal sont conservées.
+                    Si aucune ligne correspondante n&apos;est trouvée dans le secondaire, les colonnes <code className="bg-blue-100 dark:bg-blue-900 px-1 rounded text-xs">alias.Col</code> seront vides pour cette ligne.
+                  </Callout>
+
+                  <Callout icon={Save} color="bg-muted/60 border-border"
+                    title="Sauvegarde des jointures">
+                    La configuration de chaque jointure (alias, clés) est sauvegardée avec la configuration.
+                    Les <strong>fichiers eux-mêmes ne sont pas stockés</strong> — vous devrez les re-uploader après chargement d&apos;une config.
+                    Les champs alias et clés seront déjà pré-remplis.
+                  </Callout>
+                </div>
+              </div>
+
+              {/* Filters ET/OU */}
+              <div className="mt-8">
+                <SectionAnchor id="mapping-filters" />
+                <h3 className="font-semibold text-base mb-3 flex items-center gap-2">
+                  <Filter className="h-4 w-4 text-muted-foreground" />
+                  Filtres ET / OU
+                </h3>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Il y a deux niveaux de filtres dans le mapping tool, appliqués à des moments différents du pipeline :
+                </p>
+
+                <div className="grid grid-cols-2 gap-3 mb-5">
+                  <div className="p-3 rounded-lg border bg-card">
+                    <div className="flex items-center gap-1.5 text-xs font-semibold mb-1">Filtres de lignes <Badge variant="secondary" className="text-[10px]">Source</Badge></div>
+                    <p className="text-xs text-muted-foreground">Appliqués <strong>avant</strong> le mapping, sur les colonnes du fichier source. Permettent de n&apos;importer qu&apos;un sous-ensemble de lignes.</p>
+                  </div>
+                  <div className="p-3 rounded-lg border bg-card">
+                    <div className="flex items-center gap-1.5 text-xs font-semibold mb-1">Filtres output <Badge variant="secondary" className="text-[10px]">Calculé</Badge></div>
+                    <p className="text-xs text-muted-foreground">Appliqués <strong>après</strong> le mapping et la déduplication, sur les colonnes calculées. Permettent d&apos;exclure certaines lignes du fichier final.</p>
+                  </div>
+                </div>
+
+                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-3">Logique ET / OU — groupes de conditions</p>
+                <p className="text-sm text-muted-foreground mb-3">
+                  Les filtres sont organisés en <strong>groupes</strong>. La logique fonctionne sur deux niveaux :
+                </p>
+                <div className="rounded-lg border bg-card p-4 mb-4 space-y-2 text-sm">
+                  <div className="flex items-center gap-2">
+                    <div className="px-2 py-0.5 rounded bg-blue-100 text-blue-700 text-[10px] font-bold uppercase tracking-widest">ET</div>
+                    <span className="text-muted-foreground">Les règles <strong>à l&apos;intérieur d&apos;un groupe</strong> se combinent avec ET (toutes doivent être vraies)</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="px-2 py-0.5 rounded bg-orange-100 text-orange-700 text-[10px] font-bold uppercase tracking-widest">OU</div>
+                    <span className="text-muted-foreground">En cliquant sur le badge ET, il devient OU (au moins une doit être vraie)</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="h-px flex-1 bg-border max-w-8" /><span className="text-[10px] font-bold text-muted-foreground tracking-widest">ET</span><div className="h-px flex-1 bg-border max-w-8" />
+                    <span className="text-muted-foreground">Les <strong>groupes entre eux</strong> sont toujours combinés par ET</span>
+                  </div>
+                </div>
+
+                <div>
+                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Exemple concret</p>
+                  <div className="rounded-lg border bg-muted/30 p-3 text-xs font-mono mb-3">
+                    <span className="text-blue-700 font-bold">Groupe 1 (ET)</span> : InputType ≠ TERM<br />
+                    <span className="font-bold text-muted-foreground text-[10px]">─────── ET ───────</span><br />
+                    <span className="text-orange-700 font-bold">Groupe 2 (OU)</span> : ArrTerm contient T5C<br />
+                    {"                  "}OU DepTerm contient T5C<br />
+                    {"                  "}OU ArrTerm contient R5D
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Résultat : seules les lignes avec <code className="bg-muted px-1 rounded">InputType ≠ TERM</code> <strong>ET</strong> dont au moins un des terminaux correspond sont conservées.
+                  </p>
+                </div>
+
+                <div className="mt-4">
+                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Opérateurs disponibles</p>
+                  <div className="grid grid-cols-2 gap-1.5 text-xs">
+                    {[
+                      ["= égal à", "Valeur exacte (insensible à la casse)"],
+                      ["≠ différent de", "Tout sauf cette valeur"],
+                      ["> / < / ≥ / ≤", "Comparaison numérique"],
+                      ["contient", "La cellule contient ce texte"],
+                      ["ne contient pas", "La cellule ne contient pas ce texte"],
+                      ["commence par / finit par", "Préfixe ou suffixe"],
+                      ["est vide / n'est pas vide", "Détection de valeurs nulles ou vides"],
+                    ].map(([op, desc]) => (
+                      <div key={op} className="flex gap-2 p-2 rounded border bg-card">
+                        <code className="font-mono text-[10px] text-primary shrink-0 w-32">{op}</code>
+                        <span className="text-muted-foreground text-[10px]">{desc}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
               {/* Target schema */}
               <div className="mt-8">
                 <SectionAnchor id="mapping-target" />
@@ -440,9 +575,9 @@ export default function HelpPage() {
                 </p>
                 <div className="rounded-lg border overflow-hidden mb-3">
                   <FormulaRow formula="=Weight * 2" result="Multiplie la colonne Weight par 2" />
-                  <FormulaRow formula="=UnloadTime * 1440 + UnloadDay * 1440" result="Convertit jour + fraction en minutes totales" />
+                  <FormulaRow formula="=TIMETOMIN(UnloadTime, UnloadDay)" result="Convertit heure + décalage jour en minutes totales (22:45 + jour 1 → 2805)" />
                   <FormulaRow formula="=HOUR(ArrTime) * 60 + MINUTE(ArrTime)" result="Heure → minutes depuis minuit" />
-                  <FormulaRow formula="=Day * 1440 + HOUR(Time) * 60 + MINUTE(Time)" result="Jour + temps → minutes totales (ex: jour=1, 22:45 → 2805)" />
+                  <FormulaRow formula="=TIMETOMIN(Time, Day)" result="Jour + temps → minutes totales (ex: jour=1, 22:45 → 2805)" />
                   <FormulaRow formula="=(ColA + ColB) / 2" result="Moyenne de deux colonnes (parenthèses respectées)" />
                   <FormulaRow formula="=Price * Qty - Discount" result="Expression multi-opérateurs" />
                 </div>
@@ -506,8 +641,8 @@ export default function HelpPage() {
                   <div>
                     <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Convertir en minutes</p>
                     <div className="rounded-lg border overflow-hidden">
-                      <FormulaRow formula="=HOUR(Time) * 60 + MINUTE(Time)" result="Heure « 22:45 » → 1365 minutes depuis minuit" />
-                      <FormulaRow formula="=Day * 1440 + HOUR(Time) * 60 + MINUTE(Time)" result="Jour=1, 22:45 → 2805 min totales" />
+                      <FormulaRow formula="=TIMETOMIN(Time)" result="Heure « 22:45 » → 1365 minutes depuis minuit" />
+                      <FormulaRow formula="=TIMETOMIN(Time, Day)" result="Jour=1, 22:45 → 2805 min totales (jour × 1440 + minutes)" />
                       <FormulaRow formula="=DATEDIFF(DateDep, DateArr, &quot;minute&quot;)" result="Différence entre deux dates en minutes" />
                     </div>
                   </div>
@@ -635,16 +770,141 @@ export default function HelpPage() {
                 <SectionAnchor id="mapping-advanced" />
                 <h3 className="font-semibold text-base mb-3 flex items-center gap-2">
                   <Code className="h-4 w-4 text-muted-foreground" />
-                  Fonctions avancées
+                  Fonctions avancées — contrôle d&apos;erreurs &amp; valeurs nulles
                 </h3>
                 <div className="rounded-lg border overflow-hidden">
                   <FormulaRow formula="=IFERROR(VALUE(Col), 0)" result="Retourne 0 si la formule échoue (erreur/vide)" />
+                  <FormulaRow formula="=IFNA(Col, &quot;N/A&quot;)" result="Retourne « N/A » si la valeur est nulle/NaN" />
                   <FormulaRow formula="=COALESCE(ColA, ColB, ColC)" result="Première valeur non vide parmi ColA, ColB, ColC" />
                   <FormulaRow formula="=ISBLANK(Col)" result="TRUE si la cellule est vide ou null" />
                   <FormulaRow formula="=ISNUMBER(Col)" result="TRUE si la cellule est un nombre" />
                   <FormulaRow formula="=ISTEXT(Col)" result="TRUE si la cellule est un texte non numérique" />
                   <FormulaRow formula="=IF(ISBLANK(Col), &quot;vide&quot;, Col)" result="Remplace les vides par « vide »" />
                   <FormulaRow formula="=COALESCE(PrixPromo, PrixNormal, &quot;N/A&quot;)" result="Prend PrixPromo si dispo, sinon PrixNormal, sinon N/A" />
+                </div>
+              </div>
+
+              {/* New Excel-like functions */}
+              <div className="mt-8">
+                <SectionAnchor id="mapping-excel" />
+                <h3 className="font-semibold text-base mb-3 flex items-center gap-2">
+                  <Code className="h-4 w-4 text-muted-foreground" />
+                  Fonctions Excel avancées — LET, IFS, CHOOSE, MATCH, INDEX, VLOOKUP…
+                </h3>
+
+                <Callout icon={Info} color="bg-blue-50 border-blue-200 dark:bg-blue-950/20 dark:border-blue-800 text-blue-800 dark:text-blue-300 mb-5"
+                  title="Séparateur ; accepté (Excel français/belge)">
+                  Vous pouvez utiliser <code className="bg-blue-100 dark:bg-blue-900 px-1 rounded text-xs">;</code> ou <code className="bg-blue-100 dark:bg-blue-900 px-1 rounded text-xs">,</code> comme séparateur d&apos;arguments — les deux sont acceptés. Ex : <code className="bg-blue-100 dark:bg-blue-900 px-1 rounded text-xs">=SI(p&lt;0.5; "A"; "B")</code> et <code className="bg-blue-100 dark:bg-blue-900 px-1 rounded text-xs">=IF(p&lt;0.5, "A", "B")</code> sont équivalents.
+                  Les noms français <strong>SI, ALEA, EQUIV, RECHERCHEV, CHOISIR, SOMME, MOYENNE, PUISSANCE</strong> sont aussi reconnus.
+                </Callout>
+
+                <div className="space-y-5">
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">LET — variables nommées</p>
+                    <p className="text-xs text-muted-foreground mb-2">
+                      Définit des variables réutilisables dans la même formule. Syntaxe : <code className="bg-muted px-1 rounded">LET(nom, valeur, ..., formule)</code>
+                    </p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula={'=LET(p, ALEA(), IF(p<0.5, "A", "B"))'} result={'Tire p une fois, l\'utilise dans le IF — garantit la même valeur'} />
+                      <FormulaRow formula={'=LET(p, ALEA(), IF(p<BT2, BQ2, IF(p<BT2+BU2, BR2, BS2)))'} result={'Tirage pondéré : p comparé à des seuils cumulés'} />
+                      <FormulaRow formula={'=LET(score, Weight*2+Bonus, IF(score>100, "OK", score))'} result={'Variable intermédiaire calculée depuis des colonnes'} />
+                      <FormulaRow formula={'=LET(a, ColA, b, ColB, (a+b)/2)'} result={'Plusieurs variables : moyenne de deux colonnes'} />
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-2">
+                      La formule utilise la syntaxe <code className="bg-muted px-1 rounded">;</code> d&apos;Excel français : <code className="bg-muted px-1 rounded">=LET(p;ALEA();SI(p&lt;BT2;BQ2;SI(p&lt;BT2+BU2;BR2;BS2)))</code>
+                    </p>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">IFS / SI.CONDITIONS — cascades de IF sans SINON</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula={'=IFS(Score>=90,"A", Score>=75,"B", Score>=60,"C")'} result={'Première condition vraie gagne, les suivantes ignorées'} />
+                      <FormulaRow formula={'=IFS(Terminal="T1","Nord", Terminal="T2","Nord", Terminal="T5","Sud")'} result={'Regroupement multi-valeurs'} />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">CHOOSE / CHOISIR — sélection par indice</p>
+                    <p className="text-xs text-muted-foreground mb-2">Index 1-based : CHOOSE(1, …) retourne le 1er choix.</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula={'=CHOOSE(Priority, "Haute", "Moyenne", "Basse")'} result={'Priority=1 → Haute, 2 → Moyenne, 3 → Basse'} />
+                      <FormulaRow formula={'=CHOOSE(MONTH(DateCol), "Jan","Fév","Mar","Avr","Mai","Jun","Jul","Aoû","Sep","Oct","Nov","Déc")'} result={'Mois en abrégé français'} />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">MATCH / EQUIV — position d&apos;une valeur dans une colonne</p>
+                    <p className="text-xs text-muted-foreground mb-2">
+                      Retourne l&apos;index 1-based de la première ligne où <code className="bg-muted px-1 rounded">search_col = lookup</code>.
+                    </p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula="=MATCH(FlightId, RefCol, 0)" result="Position de FlightId dans RefCol (1-based)" />
+                      <FormulaRow formula={'=MATCH("AF123", CodeCol, 0)'} result="Cherche la constante « AF123 » dans CodeCol" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">INDEX — valeur à une position donnée</p>
+                    <p className="text-xs text-muted-foreground mb-2">
+                      Retourne la valeur de <code className="bg-muted px-1 rounded">col</code> à la ligne <code className="bg-muted px-1 rounded">row_num</code> (1-based). S&apos;utilise souvent avec MATCH.
+                    </p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula="=INDEX(NameCol, 1)" result="Valeur de NameCol à la ligne 1 (constante pour toutes les lignes)" />
+                      <FormulaRow formula="=INDEX(ResultCol, MATCH(FlightId, KeyCol, 0))" result="Équivalent RECHERCHEV : cherche FlightId dans KeyCol, retourne ResultCol" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">VLOOKUP / RECHERCHEV — lookup dans le même dataframe</p>
+                    <p className="text-xs text-muted-foreground mb-2">
+                      Cherche <code className="bg-muted px-1 rounded">lookup</code> dans <code className="bg-muted px-1 rounded">key_col</code>, retourne la valeur correspondante de <code className="bg-muted px-1 rounded">result_col</code>.
+                      Pour des lookups <strong>inter-fichiers</strong>, utilisez les jointures (alias.Col).
+                    </p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula="=VLOOKUP(FlightId, RefId, GateName, 0)" result="Cherche FlightId dans RefId, retourne GateName de la même ligne" />
+                      <FormulaRow formula="=RECHERCHEV(CodeVol, RefCode, Terminal, 0)" result="Alias français" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">RAND / ALEA — nombre aléatoire</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula="=RAND()" result="Flottant aléatoire [0, 1) — différent pour chaque ligne" />
+                      <FormulaRow formula="=ALEA()" result="Alias français de RAND()" />
+                      <FormulaRow formula="=RANDBETWEEN(1, 100)" result="Entier aléatoire entre 1 et 100" />
+                      <FormulaRow formula="=ALEA.ENTRE.BORNES(1, 6)" result="Dé à 6 faces — alias français" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Fonctions mathématiques</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula="=MOD(Value, 3)" result="Reste de la division de Value par 3 (0, 1 ou 2)" />
+                      <FormulaRow formula="=POWER(Base, 2)" result="Carré de Base (alias : PUISSANCE)" />
+                      <FormulaRow formula="=SQRT(Area)" result="Racine carrée de Area" />
+                      <FormulaRow formula="=MIN(ColA, ColB, ColC)" result="Minimum par ligne entre plusieurs colonnes" />
+                      <FormulaRow formula="=MAX(ColA, 0)" result="Seuil minimum à 0 (aucune valeur négative)" />
+                      <FormulaRow formula="=SUM(ColA, ColB, ColC)" result="Somme de plusieurs colonnes par ligne (alias : SOMME)" />
+                      <FormulaRow formula="=AVERAGE(ColA, ColB, ColC)" result="Moyenne de plusieurs colonnes par ligne (alias : MOYENNE)" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Conversion du temps</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula="=TIMETOMIN(Time)" result="Heure → minutes depuis minuit (22:45 → 1365)" />
+                      <FormulaRow formula="=TIMETOMIN(Time, Day)" result="Avec décalage jour (jour=1, 22:45 → 2805)" />
+                      <FormulaRow formula="=TIMETOHOUR(Time)" result="Heure → heures décimales (22:45 → 22.75)" />
+                      <FormulaRow formula="=TIMETOHOUR(Time, Day)" result="Avec décalage jour (jour=1, 22:45 → 46.75)" />
+                      <FormulaRow formula="=TIMETOSEC(Time)" result="Heure → secondes depuis minuit (22:45 → 81900)" />
+                      <FormulaRow formula="=TIMETOSEC(Time, Day)" result="Avec décalage jour (jour=1, 22:45 → 168300)" />
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-2">
+                      Ces fonctions gèrent tous les formats d&apos;entrée : <code className="bg-muted px-1 rounded">timedelta</code>, fraction Excel (0–1), <code className="bg-muted px-1 rounded">datetime.time</code>, ou chaîne texte.
+                    </p>
+                  </div>
+
                 </div>
               </div>
 
@@ -755,8 +1015,12 @@ export default function HelpPage() {
                   Configurations sauvegardées
                 </h3>
                 <p className="text-sm text-muted-foreground mb-4">
-                  Une configuration enregistre l&apos;intégralité du tableau de mapping (colonnes, formules, PK, agrégations, option dédup). Elle est stockée dans Supabase et accessible depuis n&apos;importe quelle session.
+                  Une configuration enregistre l&apos;intégralité du mapping : colonnes, formules, PK, agrégations, option dédup, <strong>filtres groupés ET/OU</strong> (source et output), et la <strong>configuration des jointures</strong> (alias + clés). Elle est stockée dans Supabase et accessible depuis n&apos;importe quelle session.
                 </p>
+                <Callout icon={Info} color="bg-amber-50 border-amber-200 dark:bg-amber-950/20 dark:border-amber-800 text-amber-800 dark:text-amber-300 mb-4"
+                  title="Fichiers secondaires non stockés">
+                  Les fichiers secondaires (JOIN) <strong>ne sont pas sauvegardés</strong> (trop volumineux). Au chargement d&apos;une config, les alias et les clés de jointure sont restaurés, mais vous devrez <strong>re-uploader les fichiers</strong> secondaires manuellement.
+                </Callout>
                 <div className="grid grid-cols-3 gap-3">
                   <div className="p-3 rounded-lg border bg-card">
                     <div className="flex items-center gap-2 mb-1.5">

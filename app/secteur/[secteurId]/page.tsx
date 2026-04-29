@@ -1,64 +1,73 @@
 "use client"
 
 import { useEffect, useState } from "react"
+import { useParams } from "next/navigation"
 import { Loader2, Plus } from "lucide-react"
 
-import { AppShell } from "@/components/app-shell"
-import { PhotoCard, CreateCard, ENTREPRISE_IMAGE } from "@/components/photo-card"
-import { supabase, type Entreprise } from "@/lib/supabase"
+import { WorkspaceShell } from "@/components/app-shell-workspace"
+import { PhotoCard, CreateCard, PROJET_IMAGE } from "@/components/photo-card"
+import { supabase, type Secteur, type Entreprise } from "@/lib/supabase"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { toast } from "sonner"
 
-interface EntrepriseCard extends Entreprise {
-  secteurCount: number
-}
+interface ProjetCard { id: string; name: string; created_at: string | null; background_url: string | null; code: string | null; scenarioCount: number }
 
 type Modal =
   | { type: "create" }
   | { type: "rename"; id: string; name: string }
   | { type: "delete"; id: string; name: string }
 
-export default function HomePage() {
-  const [entreprises, setEntreprises] = useState<EntrepriseCard[]>([])
+export default function SecteurPage() {
+  const { secteurId } = useParams<{ secteurId: string }>()
+  const [secteur, setSecteur] = useState<Secteur | null>(null)
+  const [entreprise, setEntreprise] = useState<Entreprise | null>(null)
+  const [projets, setProjets] = useState<ProjetCard[]>([])
   const [loading, setLoading] = useState(true)
   const [modal, setModal] = useState<Modal | null>(null)
   const [inputName, setInputName] = useState("")
+  const [inputCode, setInputCode] = useState("")
   const [inputUrl, setInputUrl] = useState("")
   const [saving, setSaving] = useState(false)
 
-  useEffect(() => { load() }, [])
+  useEffect(() => { load() }, [secteurId])
 
   async function load() {
     setLoading(true)
-    const { data } = await supabase.from("entreprises").select("*").order("created_at")
-    if (!data) { setLoading(false); return }
+    const { data: sec } = await supabase.from("secteurs").select("*").eq("id", secteurId).single()
+    if (sec) {
+      setSecteur(sec)
+      const { data: ent } = await supabase.from("entreprises").select("*").eq("id", sec.entreprise_id).single()
+      if (ent) setEntreprise(ent)
+    }
+    const { data: projs } = await supabase.from("projets").select("*").eq("secteur_id", secteurId).order("created_at")
+    if (!projs) { setLoading(false); return }
+
     const cards = await Promise.all(
-      data.map(async ent => {
-        const { count } = await supabase.from("secteurs").select("*", { count: "exact", head: true }).eq("entreprise_id", ent.id)
-        return { ...ent, secteurCount: count ?? 0 }
+      projs.map(async p => {
+        const { count } = await supabase.from("scenarios").select("*", { count: "exact", head: true }).eq("projet_id", p.id)
+        return { id: p.id, name: p.name, created_at: p.created_at, background_url: p.background_url, code: p.code, scenarioCount: count ?? 0 }
       })
     )
-    setEntreprises(cards)
+    setProjets(cards)
     setLoading(false)
   }
 
-  function openCreate() { setInputName(""); setInputUrl(""); setModal({ type: "create" }) }
+  function openCreate() { setInputName(""); setInputCode(""); setInputUrl(""); setModal({ type: "create" }) }
   function openRename(id: string, name: string) { setInputName(name); setModal({ type: "rename", id, name }) }
   function openDelete(id: string, name: string) { setModal({ type: "delete", id, name }) }
   function closeModal() { setModal(null) }
 
   async function handleCreate() {
-    const name = inputName.trim()
-    if (!name) return
+    const name = inputName.trim(); if (!name) return
     setSaving(true)
     try {
-      const payload: Record<string, unknown> = { name }
+      const payload: Record<string, unknown> = { name, secteur_id: secteurId }
+      if (inputCode.trim()) payload.code = inputCode.trim()
       if (inputUrl.trim()) payload.background_url = inputUrl.trim()
-      const { error } = await supabase.from("entreprises").insert(payload)
+      const { error } = await supabase.from("projets").insert(payload)
       if (error) throw error
-      toast.success(`"${name}" créée`)
-      closeModal(); load()
+      toast.success(`"${name}" créé`); closeModal(); load()
     } catch { toast.error("Erreur lors de la création") }
     finally { setSaving(false) }
   }
@@ -68,10 +77,9 @@ export default function HomePage() {
     const name = inputName.trim(); if (!name) return
     setSaving(true)
     try {
-      const { error } = await supabase.from("entreprises").update({ name }).eq("id", modal.id)
-      if (error) throw error
-      toast.success("Renommée"); closeModal(); load()
-    } catch { toast.error("Erreur lors du renommage") }
+      await supabase.from("projets").update({ name }).eq("id", modal.id)
+      toast.success("Renommé"); closeModal(); load()
+    } catch { toast.error("Erreur") }
     finally { setSaving(false) }
   }
 
@@ -79,30 +87,29 @@ export default function HomePage() {
     if (modal?.type !== "delete") return
     setSaving(true)
     try {
-      const { error } = await supabase.from("entreprises").delete().eq("id", modal.id)
-      if (error) throw error
-      toast.success("Supprimée"); closeModal(); load()
-    } catch { toast.error("Erreur lors de la suppression") }
+      await supabase.from("projets").delete().eq("id", modal.id)
+      toast.success("Supprimé"); closeModal(); load()
+    } catch { toast.error("Erreur") }
     finally { setSaving(false) }
   }
 
   return (
-    <AppShell>
-      <div className="min-h-[calc(100vh-64px)] bg-background">
-        <div className="bg-white border-b border-border px-8 pt-6 pb-5">
+    <WorkspaceShell>
+      <div className="min-h-full">
+        <div className="border-b border-border bg-white px-8 pt-6 pb-5">
           <div className="flex items-end justify-between">
             <div>
-              <p className="text-[11px] font-bold uppercase tracking-[0.08em] text-primary">Project</p>
-              <h1 className="mt-1 text-2xl font-black tracking-tight uppercase">Project Management</h1>
+              <p className="text-[11px] font-bold uppercase tracking-[0.08em] text-primary">
+                {entreprise?.name ?? "…"} / Secteur
+              </p>
+              <h1 className="mt-1 text-2xl font-black uppercase tracking-tight">{secteur?.name ?? "…"}</h1>
               <p className="mt-0.5 text-sm text-muted-foreground">
-                Manage and collaborate on airport performance scenarios
+                {projets.length} projet{projets.length !== 1 ? "s" : ""}
               </p>
             </div>
-            <button
-              onClick={openCreate}
-              className="flex items-center gap-2 rounded-lg bg-primary px-5 py-2.5 text-sm font-semibold text-white hover:bg-primary/90 transition-colors shadow-sm"
-            >
-              <Plus className="h-4 w-4" /> Nouvelle Entreprise
+            <button onClick={openCreate}
+              className="flex items-center gap-2 rounded-lg bg-primary px-5 py-2.5 text-sm font-semibold text-white hover:bg-primary/90 transition-colors shadow-sm">
+              <Plus className="h-4 w-4" /> Nouveau projet
             </button>
           </div>
         </div>
@@ -112,32 +119,25 @@ export default function HomePage() {
             <div className="flex h-64 items-center justify-center">
               <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
             </div>
-          ) : entreprises.length === 0 ? (
-            <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-white py-24 text-center">
-              <p className="font-semibold text-[14px]">Aucune entreprise</p>
-              <p className="mt-1 text-[12px] text-muted-foreground">Créez votre première entreprise pour démarrer.</p>
-              <button onClick={openCreate} className="mt-6 rounded-lg bg-primary px-6 py-2.5 text-sm font-semibold text-white hover:bg-primary/90 transition-colors">
-                + Nouvelle Entreprise
-              </button>
-            </div>
           ) : (
             <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-              {entreprises.map(ent => (
+              {projets.map(proj => (
                 <PhotoCard
-                  key={ent.id}
-                  href={`/entreprise/${ent.id}`}
-                  name={ent.name}
-                  createdAt={ent.created_at}
-                  image={ent.background_url || ENTREPRISE_IMAGE}
-                  metric1Label="Secteurs"
-                  metric1Value={ent.secteurCount}
+                  key={proj.id}
+                  href={`/projet/${proj.id}`}
+                  name={proj.name}
+                  createdAt={proj.created_at}
+                  image={proj.background_url || PROJET_IMAGE}
+                  code={proj.code}
+                  metric1Label="Scénarios"
+                  metric1Value={proj.scenarioCount}
                   metric2Label="Quality"
                   metric2Value="0%"
-                  onRename={e => { e.preventDefault(); openRename(ent.id, ent.name) }}
-                  onDelete={e => { e.preventDefault(); openDelete(ent.id, ent.name) }}
+                  onRename={e => { e.preventDefault(); openRename(proj.id, proj.name) }}
+                  onDelete={e => { e.preventDefault(); openDelete(proj.id, proj.name) }}
                 />
               ))}
-              <CreateCard label="Nouvelle entreprise" onClick={openCreate} />
+              <CreateCard label="Nouveau projet" onClick={openCreate} />
             </div>
           )}
         </div>
@@ -145,20 +145,21 @@ export default function HomePage() {
 
       {modal?.type === "create" && (
         <ModalWrapper onClose={closeModal}>
-          <ModalHeader title="Nouvelle Entreprise" onClose={closeModal} />
+          <ModalHeader title="Nouveau projet" onClose={closeModal} />
           <div className="p-6 space-y-4">
-            <Field label="Nom de l'entreprise">
-              <Input placeholder="Ex: Air France" value={inputName}
-                onChange={e => setInputName(e.target.value)}
+            <Field label="Nom du projet">
+              <Input placeholder="Ex: Plan été 2026" value={inputName} onChange={e => setInputName(e.target.value)}
                 onKeyDown={e => e.key === "Enter" && handleCreate()} autoFocus className="rounded-lg" />
             </Field>
+            <Field label="Code projet (optionnel)">
+              <Input placeholder="Ex: HP-2026" value={inputCode} onChange={e => setInputCode(e.target.value)} className="rounded-lg" />
+            </Field>
             <Field label="Image de fond (optionnel)">
-              <Input placeholder="https://images.unsplash.com/..." value={inputUrl}
-                onChange={e => setInputUrl(e.target.value)} className="rounded-lg" />
+              <Input placeholder="https://images.unsplash.com/..." value={inputUrl} onChange={e => setInputUrl(e.target.value)} className="rounded-lg" />
             </Field>
             <Button className="w-full rounded-lg bg-primary hover:bg-primary/90 text-white font-semibold py-2.5"
               onClick={handleCreate} disabled={saving || !inputName.trim()}>
-              {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />} Créer l'entreprise
+              {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />} Créer le projet
             </Button>
           </div>
         </ModalWrapper>
@@ -182,9 +183,7 @@ export default function HomePage() {
         <ModalWrapper onClose={closeModal}>
           <ModalHeader title={`Supprimer « ${modal.name} » ?`} onClose={closeModal} color="bg-destructive" />
           <div className="p-6 space-y-4">
-            <p className="text-sm text-muted-foreground">
-              Cette action est irréversible. Tous les secteurs, projets et scénarios liés seront supprimés.
-            </p>
+            <p className="text-sm text-muted-foreground">Cette action est irréversible. Tous les scénarios liés seront supprimés.</p>
             <div className="flex gap-3">
               <Button variant="outline" className="flex-1 rounded-lg" onClick={closeModal}>Annuler</Button>
               <Button variant="destructive" className="flex-1 rounded-lg" onClick={handleDelete} disabled={saving}>
@@ -194,7 +193,7 @@ export default function HomePage() {
           </div>
         </ModalWrapper>
       )}
-    </AppShell>
+    </WorkspaceShell>
   )
 }
 
@@ -206,7 +205,6 @@ function ModalWrapper({ children, onClose }: { children: React.ReactNode; onClos
     </div>
   )
 }
-
 function ModalHeader({ title, onClose, color = "bg-primary" }: { title: string; onClose: () => void; color?: string }) {
   return (
     <div className={`flex items-center justify-between ${color} px-6 py-5`}>
@@ -215,12 +213,6 @@ function ModalHeader({ title, onClose, color = "bg-primary" }: { title: string; 
     </div>
   )
 }
-
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="space-y-1.5">
-      <label className="text-[12px] font-semibold text-foreground">{label}</label>
-      {children}
-    </div>
-  )
+  return <div className="space-y-1.5"><label className="text-[12px] font-semibold text-foreground">{label}</label>{children}</div>
 }
