@@ -24,7 +24,9 @@
       "Bash(python -m py_compile api_app.py)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('api_app.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(.venv/Scripts/python.exe -c \"compile\\(open\\('api_app.py'\\).read\\(\\), 'api_app.py', 'exec'\\); print\\('SYNTAX OK'\\)\")",
-      "Bash(python -c \"compile\\(open\\('api_app.py', encoding='utf-8-sig'\\).read\\(\\), 'api_app.py', 'exec'\\); print\\('SYNTAX OK'\\)\")"
+      "Bash(python -c \"compile\\(open\\('api_app.py', encoding='utf-8-sig'\\).read\\(\\), 'api_app.py', 'exec'\\); print\\('SYNTAX OK'\\)\")",
+      "Bash(git checkout *)",
+      "Bash(git stash *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\ASA\\Desktop\\perso\\projects\\carousel-allocation-tool\\app\\projet\\[projetId]",
