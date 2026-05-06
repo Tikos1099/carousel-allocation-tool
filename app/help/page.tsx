@@ -80,6 +80,7 @@ const TOC = [
   { id: "mapping-row", label: "  → Séquences ROW()" },
   { id: "mapping-advanced", label: "  → Fonctions avancées" },
   { id: "mapping-excel", label: "  → LET · IFS · MATCH · VLOOKUP…" },
+  { id: "mapping-nested", label: "  → Formules imbriquées" },
   { id: "mapping-crosscol", label: "  → Colonnes intermédiaires" },
   { id: "mapping-dedup", label: "  → Dédupliquer par PK" },
   { id: "mapping-configs", label: "  → Configurations" },
@@ -548,18 +549,51 @@ export default function HelpPage() {
                   <Code className="h-4 w-4 text-muted-foreground" />
                   Fonctions texte
                 </h3>
-                <div className="rounded-lg border overflow-hidden">
-                  <FormulaRow formula="=LEFT(FlightNum, 2)" result="2 premiers caractères → « AF » depuis « AF123 »" />
-                  <FormulaRow formula="=RIGHT(Route, 3)" result="3 derniers caractères → « CDG » depuis « ORLY-CDG »" />
-                  <FormulaRow formula="=MID(Code, 2, 4)" result="Substring depuis position 2, longueur 4" />
-                  <FormulaRow formula="=LEN(Name)" result="Nombre de caractères" />
-                  <FormulaRow formula="=UPPER(Terminal)" result="Majuscules → « T2 » depuis « t2 »" />
-                  <FormulaRow formula="=LOWER(Status)" result="Minuscules → « done » depuis « DONE »" />
-                  <FormulaRow formula="=TRIM(Name)" result="Supprime les espaces en début et fin" />
-                  <FormulaRow formula={'=TEXTBEFORE(Route, "/")'} result={'Texte avant le séparateur → « ORLY » depuis « ORLY/CDG »'} />
-                  <FormulaRow formula={'=TEXTAFTER(Route, "-")'} result={'Texte après le séparateur → « CDG » depuis « ORLY-CDG »'} />
-                  <FormulaRow formula={'=SUBSTITUTE(Code, "OLD", "NEW")'} result={'Remplace toutes les occurrences de « OLD » par « NEW »'} />
-                  <FormulaRow formula={'=CONCAT(ColA, ColB, ColC)'} result={'Concaténation multi-colonnes (alias de &)'} />
+                <div className="space-y-4">
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Extraction</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula="=LEFT(FlightNum, 2)" result="2 premiers caractères → « AF » depuis « AF123 »" />
+                      <FormulaRow formula="=LEFT(FlightNum, LEN(FlightNum)-3)" result="Tout sauf les 3 derniers caractères — argument formule" />
+                      <FormulaRow formula="=RIGHT(Route, 3)" result="3 derniers caractères → « CDG » depuis « ORLY-CDG »" />
+                      <FormulaRow formula="=RIGHT(Code, LEN(Code)-2)" result="Tout sauf les 2 premiers — argument formule" />
+                      <FormulaRow formula="=MID(Code, 2, 4)" result="Substring depuis position 2, longueur 4" />
+                      <FormulaRow formula="=MID(Code, FIND(&quot;-&quot;, Code)+1, 3)" result="3 caractères après le tiret — start = formule" />
+                      <FormulaRow formula="=LEN(Name)" result="Nombre de caractères" />
+                    </div>
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Recherche de position — FIND / SEARCH</p>
+                    <p className="text-xs text-muted-foreground mb-2">
+                      Retourne la <strong>position 1-based</strong> du texte cherché, ou vide si absent. S&apos;utilise souvent avec <code className="bg-muted px-1 rounded">ISNUMBER</code> pour tester la présence.
+                    </p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula={'=FIND("+", Col)'} result={'Position du « + » dans Col → 3 depuis « AF+123 », vide si absent'} />
+                      <FormulaRow formula={'=FIND("-", Col, 3)'} result={'Cherche « - » en partant du 3ᵉ caractère'} />
+                      <FormulaRow formula={'=SEARCH("t5c", Col)'} result={'Idem FIND mais insensible à la casse → trouve « T5C » ou « t5c »'} />
+                      <FormulaRow formula={'=ISNUMBER(FIND("+", Col))'} result={'TRUE si « + » est présent dans Col'} />
+                      <FormulaRow formula={'=IF(ISNUMBER(FIND("+", Col)), TEXTBEFORE(Col, "+"), Col)'} result={'Texte avant « + » si présent, sinon la valeur brute'} />
+                    </div>
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Découpage par délimiteur</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula={'=TEXTBEFORE(Route, "/")'} result={'Texte avant le séparateur → « ORLY » depuis « ORLY/CDG »'} />
+                      <FormulaRow formula={'=TEXTBEFORE(Route, LEFT(SepCol, 1))'} result={'Délimiteur vient d\'une colonne — argument formule'} />
+                      <FormulaRow formula={'=TEXTAFTER(Route, "-")'} result={'Texte après le séparateur → « CDG » depuis « ORLY-CDG »'} />
+                    </div>
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Transformation & assemblage</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula="=UPPER(Terminal)" result="Majuscules → « T2 » depuis « t2 »" />
+                      <FormulaRow formula="=LOWER(Status)" result="Minuscules → « done » depuis « DONE »" />
+                      <FormulaRow formula="=TRIM(Name)" result="Supprime les espaces en début et fin" />
+                      <FormulaRow formula={'=SUBSTITUTE(Code, "OLD", "NEW")'} result={'Remplace toutes les occurrences de « OLD » par « NEW »'} />
+                      <FormulaRow formula={'=SUBSTITUTE(Code, LEFT(OldCol,3), RIGHT(NewCol,3))'} result={'Old et new viennent de formules — arguments formules'} />
+                      <FormulaRow formula={'=CONCAT(ColA, "-", ColB)'} result={'Concaténation multi-colonnes (alias de &)'} />
+                    </div>
+                  </div>
                 </div>
               </div>
 
@@ -903,6 +937,97 @@ export default function HelpPage() {
                     <p className="text-xs text-muted-foreground mt-2">
                       Ces fonctions gèrent tous les formats d&apos;entrée : <code className="bg-muted px-1 rounded">timedelta</code>, fraction Excel (0–1), <code className="bg-muted px-1 rounded">datetime.time</code>, ou chaîne texte.
                     </p>
+                  </div>
+
+                </div>
+              </div>
+
+              {/* Nested formulas */}
+              <div className="mt-8">
+                <SectionAnchor id="mapping-nested" />
+                <h3 className="font-semibold text-base mb-3 flex items-center gap-2">
+                  <Code className="h-4 w-4 text-muted-foreground" />
+                  Formules imbriquées — toutes les combinaisons
+                </h3>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Le moteur évalue chaque argument de façon <strong>récursive</strong> : n&apos;importe quelle fonction peut recevoir n&apos;importe quelle autre fonction comme argument, à profondeur illimitée.
+                </p>
+
+                <Callout icon={CheckCircle} color="bg-green-50 border-green-200 dark:bg-green-950/20 dark:border-green-800 text-green-800 dark:text-green-300 mb-5"
+                  title="Toutes les combinaisons fonctionnent">
+                  <code className="bg-green-100 dark:bg-green-900 px-1 rounded text-xs">IFERROR(INDEX(Col, MATCH(A&amp;B, KeyCol, 0)), "")</code> — lookup avec clé composée<br />
+                  <code className="bg-green-100 dark:bg-green-900 px-1 rounded text-xs">IF(ISNUMBER(FIND("+", Col)), TEXTBEFORE(Col, "+"), Col)</code> — FIND dans IF<br />
+                  <code className="bg-green-100 dark:bg-green-900 px-1 rounded text-xs">LEFT(Col, LEN(Col) - RIGHT(SizeCol, 2))</code> — formules dans LEFT/RIGHT
+                </Callout>
+
+                <div className="space-y-5">
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Lookup avec clé composée</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula={'=IFERROR(INDEX(KeyCol, MATCH(A & B, RefCol, 0)), "")'} result={'Cherche la concaténation A&B dans RefCol, retourne KeyCol. Vide si absent.'} />
+                      <FormulaRow formula={'=IFERROR(INDEX(Col, MATCH(FlightId & Term, CompositeKey, 0)), "N/A")'} result={'Clé composite vol+terminal'} />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">IFERROR + IF + conditions multiples</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow
+                        formula={'=IFERROR(IF(BM3>0, IF(AND(BH3>0, BE3=0), VLOOKUP(N3, RefA, 4, 0), IF(BE3=0, VLOOKUP(N3, RefB, 2, 0), BY3)), ""), 0)'}
+                        result={'VLOOKUP conditionnel imbriqué dans plusieurs IF — retourne 0 sur erreur'}
+                      />
+                      <FormulaRow
+                        formula={'=IF(BJ4=0, IFERROR(INDEX(QCol, MATCH(V4, ACol, 0)), INDEX(QCol, MATCH(U4, BCol, 0))), BZ4)'}
+                        result={'INDEX/MATCH en fallback : essaie V4 sur ACol, sinon U4 sur BCol'}
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Conditions sur fonctions texte</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow
+                        formula={'=IF(OR(LEFT(Col1,3)="T5C", LEFT(Col2,3)="T5C", LEFT(Col1,3)="R5C", LEFT(Col1,3)="R5D"), "include", "omit")'}
+                        result={'OR avec plusieurs LEFT imbriqués'}
+                      />
+                      <FormulaRow
+                        formula={'=IF(ISNUMBER(SEARCH("+", Col)), TEXTBEFORE(Col, "+"), Col)'}
+                        result={'SEARCH dans ISNUMBER dans IF — retourne la partie avant + si présent'}
+                      />
+                      <FormulaRow
+                        formula={'=IF(OR(Status="Tx", Status="CI"), IF(OR(LEFT(N,3)="T5C", LEFT(Y,3)="T5C", LEFT(N,3)="R5D"), "include", "omit"), "omit")'}
+                        result={'IF imbriqué avec OR et LEFT — reproduit une formule Excel complexe'}
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">LET avec tirage pondéré</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow
+                        formula={'=LET(p, RAND(), IF(p<BT2, BQ2, IF(p<BT2+BU2, BR2, BS2)))'}
+                        result={'p est tiré une seule fois et réutilisé dans les deux IF — tirage pondéré 3 catégories'}
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Calculs sur taille de texte</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula={'=LEFT(Col, LEN(Col)-3)'} result={'Tout sauf les 3 derniers caractères'} />
+                      <FormulaRow formula={'=RIGHT(Col, LEN(Col)-2)'} result={'Tout sauf les 2 premiers caractères'} />
+                      <FormulaRow formula={'=MID(Col, FIND("-", Col)+1, LEN(Col))'} result={'Tout ce qui suit le premier tiret'} />
+                      <FormulaRow formula={'=IFERROR(TEXTBEFORE(Col, "+"), Col)'} result={'Texte avant « + » si présent, sinon valeur brute — robuste'} />
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">ROUND / SUBSTITUTE avec formules</p>
+                    <div className="rounded-lg border overflow-hidden">
+                      <FormulaRow formula={'=ROUND(ColA * ColB, VALUE(DecimalsCol))'} result={'Nombre de décimales vient d\'une colonne'} />
+                      <FormulaRow formula={'=SUBSTITUTE(Col, LEFT(OldCol, 3), RIGHT(NewCol, 3))'} result={'Ancien et nouveau texte calculés depuis d\'autres colonnes'} />
+                    </div>
                   </div>
 
                 </div>

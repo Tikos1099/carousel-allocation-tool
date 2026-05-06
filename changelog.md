@@ -1,5 +1,45 @@
 # Changelog
 
+## [2026-04-30] — Extraction moteur de formules + 3 bug fixes
+
+### `formula_engine.py` — nouveau fichier (extrait de `api_app.py`)
+
+Toute la logique d'évaluation des formules est maintenant isolée dans `formula_engine.py` à la racine. `api_app.py` importe les 5 fonctions depuis ce fichier.
+
+```python
+from formula_engine import (
+    _split_formula_args, _find_comparison_in_cond,
+    _rfind_op_at_depth0, _eval_condition, _eval_mapping_formula,
+)
+```
+
+**Avantages :** plus facile à lire, modifier et débugger sans toucher au reste de l'API.
+
+### Bug fixes
+
+**Bug 1 — Fonctions texte non récursives** (`LEFT`, `RIGHT`, `MID`, `LEN`, `UPPER`, `LOWER`, `TRIM`, `TEXTBEFORE`, `TEXTAFTER`)
+
+Avant : `if col in df.columns: return df[col]...` → retournait vide silencieusement si le 1er argument était une formule imbriquée.
+
+Après : `src = _eval_mapping_formula(col, df)` → `LEFT(RIGHT(Col,5),3)`, `UPPER(TRIM(Col))`, etc. fonctionnent correctement.
+
+**Bug 2 — `IF` avec condition booléenne (`ISBLANK`, `ISNUMBER`, `ISTEXT`)**
+
+Avant : `_eval_condition("ISBLANK(Col)")` ne trouvait pas d'opérateur de comparaison et retournait `[True, True, …]` → la branche vraie du IF était **toujours** prise.
+
+Après : fallback → évalue la condition comme formule et caste en `bool`.
+
+**Bug 3 — Comparaison string au lieu de numérique dans `_eval_condition`**
+
+Avant : quand le côté droit est une colonne ou formule (ex. `p < Par1`, `p < Par2+Par3`), les deux côtés étaient castés en `str` :
+- Colonne absente → `""` → `"0.xxx" < ""` toujours **False**
+- Résultat NaN → `"nan"` → `"0.xxx" < "nan"` toujours **True** (`'0' < 'n'`)
+- Ces deux cas combinés causaient le symptôme **"toujours Car 2"** dans `LET(p,ALEA(),IF(…))`.
+
+Après : `pd.to_numeric` d'abord → comparaison numérique si le côté droit a des valeurs valides, string sinon.
+
+---
+
 ## [2026-04-29] — Modern UI Redesign & Flexible Hierarchy
 
 ### UI Redesign
