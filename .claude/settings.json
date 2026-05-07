@@ -50,7 +50,11 @@
       "PowerShell($lines = Get-Content 'C:\\\\Users\\\\ASA\\\\Downloads\\\\test \\(1\\)\\\\Mapping Tool - Standalone.html'; $line = $lines[187]; $idx = $line.IndexOf\\('id=\\\\\"root\\\\\"'\\); Write-Output \"Root found at: $idx\"; Write-Output \"Total line length: $\\($line.Length\\)\"; $line.Substring\\($idx, 200\\))",
       "PowerShell($lines = Get-Content 'C:\\\\Users\\\\ASA\\\\Downloads\\\\test \\(1\\)\\\\Mapping Tool - Standalone.html'; for \\($i = 54; $i -lt 187; $i++\\) { if \\($lines[$i].Length -gt 100\\) { Write-Output \"Line $\\($i+1\\): length=$\\($lines[$i].Length\\) preview=$\\($lines[$i].Substring\\(0, [Math]::Min\\(100, $lines[$i].Length\\)\\)\\)\" } })",
       "PowerShell($lines = Get-Content 'C:\\\\Users\\\\ASA\\\\Downloads\\\\test \\(1\\)\\\\Mapping Tool - Standalone.html'; $line = $lines[187]; $idx = $line.IndexOf\\('id=\"root\"'\\); $endIdx = $line.IndexOf\\('</style>'\\); Write-Output \"End of style at: $endIdx\"; $endBody = $line.IndexOf\\('</body>'\\); Write-Output \"End of body at: $endBody\"; $htmlStart = $line.IndexOf\\('<div id=\"app\"'\\); if \\($htmlStart -lt 0\\) { $htmlStart = $line.IndexOf\\('function App'\\); }; Write-Output \"App/html start: $htmlStart\")",
-      "PowerShell($lines = Get-Content 'C:\\\\Users\\\\ASA\\\\Downloads\\\\test \\(1\\)\\\\Mapping Tool - Standalone.html'; $line = $lines[187]; $idx = $line.IndexOf\\(':root'\\); $cssContent = $line.Substring\\($idx, 40000\\); Write-Output $cssContent.Length; $cssContent | Set-Content -Path 'C:\\\\Temp\\\\mapping_css.txt' -Encoding UTF8)"
+      "PowerShell($lines = Get-Content 'C:\\\\Users\\\\ASA\\\\Downloads\\\\test \\(1\\)\\\\Mapping Tool - Standalone.html'; $line = $lines[187]; $idx = $line.IndexOf\\(':root'\\); $cssContent = $line.Substring\\($idx, 40000\\); Write-Output $cssContent.Length; $cssContent | Set-Content -Path 'C:\\\\Temp\\\\mapping_css.txt' -Encoding UTF8)",
+      "Bash(Get-ChildItem \"c:\\\\Users\\\\ASA\\\\Desktop\\\\perso\\\\projects\\\\carousel-allocation-tool\\\\storage\\\\sessions\" -ErrorAction SilentlyContinue)",
+      "Bash(Select-Object Name, Length, LastWriteTime)",
+      "Bash(Format-Table)",
+      "PowerShell(python \"c:\\\\Users\\\\ASA\\\\Desktop\\\\perso\\\\projects\\\\carousel-allocation-tool\\\\_cleanup_api.py\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\ASA\\Desktop\\perso\\projects\\carousel-allocation-tool\\app\\projet\\[projetId]",
