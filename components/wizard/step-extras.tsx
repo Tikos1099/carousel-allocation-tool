@@ -233,6 +233,25 @@ export function StepExtras({ state, updateState, onNext, onPrevious }: StepExtra
       </CardHeader>
       <CardContent className="space-y-6">
         <div className="space-y-4">
+          <h4 className="text-sm font-medium">Options d{"'"}allocation</h4>
+          <div className="flex items-start gap-3 rounded-lg border p-4">
+            <Checkbox
+              checked={state.rules.wideCanUseNarrow}
+              onCheckedChange={(checked) =>
+                handleRuleToggle("wideCanUseNarrow", Boolean(checked))
+              }
+              className="mt-0.5"
+            />
+            <div className="flex-1">
+              <Label>Vols Wide peuvent utiliser les positions Narrow</Label>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Si un vol Wide n{"'"}a pas assez de positions Wide disponibles, il peut deborder sur les positions Narrow.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-4">
           <h4 className="text-sm font-medium">Readjustement</h4>
           <div className="flex items-center gap-3 rounded-lg border p-4">
             <Checkbox

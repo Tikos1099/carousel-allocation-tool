@@ -1,6 +1,6 @@
 "use client"
 
-import { Suspense, useEffect, useState } from "react"
+import { Suspense, useCallback, useEffect, useState } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { toast } from "sonner"
 
@@ -35,6 +35,7 @@ export interface WizardState {
   carousels: AllocationConfig["carousels"]
   rules: AllocationConfig["rules"]
   extrasByTerminal: AllocationConfig["extrasByTerminal"]
+  runName: string
 }
 
 const initialState: WizardState = {
@@ -61,6 +62,7 @@ const initialState: WizardState = {
   carousels: [],
   rules: {
     applyReadjustment: true,
+    wideCanUseNarrow: true,
     ruleMulti: true,
     ruleNarrowWide: false,
     ruleExtras: true,
@@ -69,6 +71,7 @@ const initialState: WizardState = {
     ruleOrder: [],
   },
   extrasByTerminal: {},
+  runName: "",
 }
 
 export default function WizardPageWrapper() {
@@ -85,9 +88,9 @@ function WizardPage() {
   const [isRunning, setIsRunning] = useState(false)
   const [isHydrated, setIsHydrated] = useState(false)
 
-  const updateState = (updates: Partial<WizardState>) => {
+  const updateState = useCallback((updates: Partial<WizardState>) => {
     setState((prev) => ({ ...prev, ...updates }))
-  }
+  }, [])
 
   const canProceed = (step: number): boolean => {
     switch (step) {
@@ -214,18 +217,15 @@ function WizardPage() {
         extrasByTerminal: state.extrasByTerminal,
       }
 
-      const scenarioName =
-        typeof window !== "undefined"
-          ? (window.sessionStorage.getItem("carousel_scenario_name") ?? undefined)
-          : undefined
-      const { jobId } = await runJob(state.file, config, scenarioName)
+      const runName = state.runName.trim() || undefined
+      const { jobId } = await runJob(state.file, config, runName)
 
-      // If launched from a scenario, save the run to allocation_runs and navigate back
+      // If launched from a scenario, save the run to allocation_runs then go to results
       if (scenarioId) {
         await supabase.from("allocation_runs").insert({
           id: jobId,
           scenario_id: scenarioId,
-          name: scenarioName || null,
+          name: runName || null,
           status: "done",
           config: config as unknown as Record<string, unknown>,
           kpis: null,
@@ -235,11 +235,13 @@ function WizardPage() {
           finished_at: new Date().toISOString(),
         })
         toast.success(t.wizard.toastSuccess, { duration: 3000 })
-        router.push(`/scenario/${scenarioId}/allocation`)
+        setIsRunning(false)
+        router.push(`/results?jobId=${jobId}`)
         return
       }
 
       toast.success(t.wizard.toastSuccess, { duration: 3000 })
+      setIsRunning(false)
 
       // Redirect to results
       router.push(`/results?jobId=${jobId}`)
@@ -319,6 +321,7 @@ function WizardPage() {
         return (
           <StepRun
             state={state}
+            updateState={updateState}
             isRunning={isRunning}
             onRun={handleRunAllocation}
             onPrevious={handlePrevious}

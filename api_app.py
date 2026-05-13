@@ -1,4 +1,47 @@
-﻿
+﻿"""
+api_app.py — Serveur FastAPI : point d'entrée de l'API backend
+==============================================================
+
+RÔLE DANS LE SYSTÈME
+--------------------
+Ce fichier est le serveur HTTP de l'outil d'allocation.
+Il reçoit les requêtes du frontend (Next.js sur Vercel), exécute l'allocation,
+et renvoie les résultats (KPIs, téléchargements, tables).
+
+Il est déployé sur Railway et répond aux endpoints /api/*.
+
+ORGANISATION DU FICHIER
+------------------------
+  1. Imports
+  2. Modèles Pydantic (schémas de requête/réponse)
+  3. Dataclasses internes (JobRecord, SessionRecord, CustomKPI)
+  4. Configuration du stockage (chemins disque)
+  5. Client Supabase (persistance cloud)
+  6. Application FastAPI + CORS
+  7. Stores en mémoire (JOB_STORE, SESSION_STORE, CUSTOM_KPI_STORE)
+  8. Helpers de persistance (disque + Supabase)
+  9. Helpers de gestion de session
+ 10. Helpers de lecture des fichiers (Excel/CSV)
+ 11. Helpers de parsing de la configuration
+ 12. Pipeline d'allocation (_run_allocation_pipeline)
+ 13. Calcul des KPIs et analytics
+ 14. Écriture des fichiers de sortie (_write_outputs)
+ 15. Endpoints de l'outil d'allocation (/api/preview, /api/inspect, /api/run, …)
+ 16. Endpoints KPI custom (/api/kpis)
+ 17. Endpoints admin (/api/admin/migrate)
+ 18. Endpoints jobs (/api/jobs, /api/jobs/{id}/download, …)
+ 19. Outil de mapping (modèles + helpers + endpoints /api/mapping/*)
+
+POUR MODIFIER
+-------------
+- Ajouter un endpoint                 : ajouter @app.post("/api/...") avec sa fonction
+- Ajouter un champ de configuration   : modifier le modèle Pydantic correspondant
+- Changer l'algorithme d'allocation   : modifier allocator_engine.py (pas ce fichier)
+- Changer les fichiers de sortie      : modifier _write_outputs() ou allocator_io.py
+- Ajouter un KPI                      : modifier _compute_kpis() et CustomKPI
+- Changer le comportement des filtres : modifier _get_filter_mask() (Mapping Tool)
+"""
+
 from __future__ import annotations
 
 import json
@@ -35,7 +78,15 @@ from allocator_io import (
 from app_mapping import _apply_cat_term_mapping, _guess_col
 
 
+# ── 2. Modèles Pydantic (schémas de requête JSON) ─────────────────────────────
+
 class ColumnMapping(BaseModel):
+    """Correspondance entre les noms de colonnes du fichier source et les noms standards.
+
+    Le frontend envoie les noms bruts (ex: "Heure de départ") et ce modèle
+    les associe aux noms standards attendus par l'allocateur (ex: "DepartureTime").
+    keep_extra_cols : colonnes supplémentaires à conserver dans les résultats.
+    """
     departure_time: str = Field(..., description="Raw column for DepartureTime")
     flight_number: str = Field(..., description="Raw column for FlightNumber")
     category: str = Field(..., description="Raw column for Category")
@@ -47,11 +98,23 @@ class ColumnMapping(BaseModel):
 
 
 class CategoryTerminalMapping(BaseModel):
+    """Tables de correspondance pour normaliser les catégories et terminaux.
+
+    categories : ex {"W": "Wide", "NB": "Narrow", "XL": "IGNORER"}
+    terminals  : ex {"TER1": "T1", "MAIN": "IGNORER"}
+    Les valeurs "IGNORER" excluent les lignes correspondantes de l'allocation.
+    """
     categories: Dict[str, str] = Field(default_factory=dict)
     terminals: Dict[str, str] = Field(default_factory=dict)
 
 
 class MakeupConfig(BaseModel):
+    """Configuration des fenêtres de makeup (ouverture/fermeture).
+
+    mode "columns" : lit MakeupOpening et MakeupClosing depuis le fichier.
+    mode "compute" : calcule ouverture/fermeture par offset depuis DepartureTime.
+    Les offsets sont en minutes avant le départ (valeurs positives).
+    """
     mode: Literal["columns", "compute"] = "columns"
     wide_open_min: int = 120
     wide_close_min: int = 60
@@ -64,6 +127,7 @@ class MakeupConfig(BaseModel):
 
 
 class CarouselCap(BaseModel):
+    """Capacité d'un carrousel : nombre de positions Wide et Narrow disponibles."""
     wide: int = 0
     narrow: int = 0
 
@@ -73,12 +137,28 @@ class CarouselCap(BaseModel):
 
 
 class CarouselsConfig(BaseModel):
+    """Configuration des carrousels disponibles pour l'allocation.
+
+    mode "manual"   : capacités saisies manuellement dans le wizard.
+    mode "file"     : capacités lues depuis un fichier Excel uploadé par terminal.
+    manual          : dict {nom_carrousel → capacité} (mode manual).
+    by_terminal     : dict {terminal → {nom_carrousel → capacité}} (mode file).
+    """
     mode: Literal["manual", "file"] = "manual"
     manual: Dict[str, CarouselCap] = Field(default_factory=dict)
     by_terminal: Dict[str, Dict[str, CarouselCap]] = Field(default_factory=dict)
 
 
 class RulesConfig(BaseModel):
+    """Configuration des règles de réajustement appliquées après l'allocation initiale.
+
+    apply_readjustment : si False, aucune règle n'est appliquée.
+    rule_multi         : autorise le split d'un vol sur plusieurs carrousels.
+    rule_narrow_wide   : autorise les vols Narrow à utiliser des positions Wide.
+    rule_extras        : autorise la création de carrousels EXTRA.
+    rule_order         : ordre d'application des règles (ex: ["multi", "extras"]).
+    max_carousels_*    : nombre maximum de carrousels alloués par vol.
+    """
     apply_readjustment: bool = True
     rule_multi: bool = True
     rule_narrow_wide: bool = False
@@ -94,10 +174,22 @@ class RulesConfig(BaseModel):
 
 
 class ExtrasConfig(BaseModel):
+    """Capacité des carrousels EXTRA à créer si la règle 'extras' est activée.
+
+    by_terminal : dict {terminal → capacité_extra}.
+    "ALL" est utilisé quand il n'y a pas de multi-terminal.
+    Si vide, la capacité est déduite automatiquement depuis les carrousels existants.
+    """
     by_terminal: Dict[str, CarouselCap] = Field(default_factory=dict)
 
 
 class ColorsConfig(BaseModel):
+    """Configuration des couleurs de mise en forme de la timeline Excel.
+
+    color_mode : "category" (Wide=rouge, Narrow=rose), "flight" (1 couleur/vol),
+                 "terminal" (1 couleur/terminal).
+    Les couleurs spéciales split et narrow_wide s'appliquent en priorité.
+    """
     color_mode: Literal["category", "terminal", "flight"] = "category"
     wide_color: str = "#D32F2F"
     narrow_color: str = "#FFEBEE"
@@ -106,6 +198,11 @@ class ColorsConfig(BaseModel):
 
 
 class RunConfig(BaseModel):
+    """Configuration complète d'un run d'allocation.
+
+    Regroupe tous les paramètres nécessaires : colonnes, mapping, makeup,
+    carrousels, règles, extras et couleurs. Envoyé par le frontend en JSON.
+    """
     columns: ColumnMapping
     mapping: CategoryTerminalMapping
     makeup: MakeupConfig = MakeupConfig()
@@ -124,12 +221,21 @@ class RunConfig(BaseModel):
 
 
 class SessionStatePayload(BaseModel):
+    """Payload pour sauvegarder l'état du wizard dans la session utilisateur."""
     current_step: Optional[int] = None
     wizard_state: Dict[str, object] = Field(default_factory=dict)
 
 
+# ── 3. Dataclasses internes ───────────────────────────────────────────────────
+
 @dataclass
 class JobRecord:
+    """Représente un job d'allocation en mémoire.
+
+    Un job est créé à chaque appel POST /api/run.
+    Il est stocké dans JOB_STORE (mémoire) et persisté sur disque + Supabase.
+    job_dir : répertoire sur disque contenant les fichiers de résultats.
+    """
     job_id: str
     status: Literal["queued", "running", "done", "error"]
     created_at: str
@@ -147,6 +253,12 @@ class JobRecord:
 
 @dataclass
 class SessionRecord:
+    """Représente la session d'un utilisateur du wizard.
+
+    La session est identifiée par un UUID transmis dans le header X-Session-Id.
+    Elle mémorise l'état du wizard (étape courante, paramètres saisis)
+    et le chemin du fichier Excel uploadé par l'utilisateur.
+    """
     session_id: str
     wizard_state: Dict[str, object] = field(default_factory=dict)
     current_step: int = 1
@@ -156,13 +268,18 @@ class SessionRecord:
     updated_at: str = ""
 
 
-
 @dataclass
 class CustomKPI:
+    """KPI personnalisé défini par l'utilisateur pour la page analytics.
+
+    metric : identifiant de la métrique (ex: "assigned_pct", "unassigned_count").
+    display_type : "percentage" | "counter" | "text".
+    alert_enabled : si True, une alerte est déclenchée selon alert_operator/threshold.
+    """
     kpi_id: str
     name: str
-    metric: str          # e.g. "assigned_pct", "unassigned_count", …
-    display_type: str    # "percentage" | "counter" | "text"
+    metric: str
+    display_type: str
     description: str = ""
     alert_enabled: bool = False
     alert_operator: str = "lt"   # "lt" | "gt"
@@ -171,6 +288,7 @@ class CustomKPI:
 
 
 class CustomKPIPayload(BaseModel):
+    """Payload pour créer ou modifier un KPI personnalisé."""
     name: str
     metric: str
     display_type: str
@@ -183,20 +301,31 @@ class CustomKPIPayload(BaseModel):
         extra = "ignore"
 
 
+# ── 4. Configuration du stockage (chemins disque) ─────────────────────────────
+
 ROOT_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = ROOT_DIR / "storage"
-JOBS_DIR = STORAGE_DIR / "jobs"
-SESSIONS_DIR = STORAGE_DIR / "sessions"
+JOBS_DIR = STORAGE_DIR / "jobs"          # Un sous-dossier par job_id
+SESSIONS_DIR = STORAGE_DIR / "sessions"  # Un fichier JSON par session
 FRONTEND_DIR = ROOT_DIR / "frontend"
 CUSTOM_KPI_FILE = STORAGE_DIR / "custom_kpis.json"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Supabase client ────────────────────────────────────────────────────────
+# ── 5. Client Supabase ────────────────────────────────────────────────────────
+
+# Le client est initialisé en lazy (à la première utilisation) pour éviter
+# de bloquer le démarrage si SUPABASE_URL n'est pas configuré.
 _supabase_client = None
 
 def _get_supabase():
+    """Retourne le client Supabase, ou None si non configuré.
+
+    Variables d'environnement requises (sur Railway) :
+        SUPABASE_URL  : URL du projet Supabase
+        SUPABASE_KEY  : service_role key (ou NEXT_PUBLIC_SUPABASE_ANON_KEY si RLS désactivé)
+    """
     global _supabase_client
     if _supabase_client is not None:
         return _supabase_client
@@ -213,8 +342,13 @@ def _get_supabase():
             pass
     return _supabase_client
 
+
+# ── 6. Application FastAPI + CORS ─────────────────────────────────────────────
+
 app = FastAPI(title="Carousel Allocation API", version="1.0")
 
+# CORS : autorise le frontend Vercel et localhost en développement.
+# Pour ajouter un domaine : ajouter à ALLOWED_ORIGINS ou modifier ALLOWED_ORIGIN_REGEX.
 ALLOWED_ORIGINS = [
     "https://carousel-allocation-tool.vercel.app",
     "http://localhost:3000",
@@ -230,18 +364,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── 7. Stores en mémoire ──────────────────────────────────────────────────────
+
+# Ces dicts sont rechargés depuis le disque et Supabase au démarrage.
+# En production (Railway), ils sont partagés entre toutes les requêtes.
 JOB_STORE: Dict[str, JobRecord] = {}
 SESSION_STORE: Dict[str, SessionRecord] = {}
 CUSTOM_KPI_STORE: Dict[str, CustomKPI] = {}
 
 
 def _utc_now() -> str:
+    """Retourne l'heure actuelle en UTC au format ISO 8601."""
     return datetime.now(timezone.utc).isoformat()
 
 
-# ── Disk persistence helpers ────────────────────────────────────────────────
+# ── 8. Helpers de persistance (disque + Supabase) ─────────────────────────────
 
 def _job_to_dict(record: JobRecord) -> dict:
+    """Sérialise un JobRecord en dict JSON-compatible pour la persistance disque."""
     return {
         "job_id": record.job_id,
         "scenario_name": record.scenario_name,
@@ -259,12 +399,18 @@ def _job_to_dict(record: JobRecord) -> dict:
 
 
 def _compute_job_storage_size(job_dir: Optional[Path]) -> int:
+    """Calcule la taille totale en octets de tous les fichiers d'un job."""
     if not job_dir or not job_dir.exists():
         return 0
     return sum(f.stat().st_size for f in job_dir.iterdir() if f.is_file())
 
 
 def _save_job_to_supabase(record: JobRecord) -> None:
+    """Sauvegarde (ou met à jour) un job dans la table Supabase "jobs".
+
+    Utilise upsert (insert ou update selon si job_id existe déjà).
+    Silencieux en cas d'erreur pour ne pas bloquer l'allocation.
+    """
     sb = _get_supabase()
     if not sb:
         return
@@ -290,6 +436,12 @@ def _save_job_to_supabase(record: JobRecord) -> None:
 
 
 def _load_jobs_from_supabase() -> None:
+    """Charge tous les jobs depuis Supabase dans JOB_STORE.
+
+    Appelée au démarrage pour récupérer les jobs persistés (ex: après redémarrage Railway).
+    Si un job existe en mémoire et en Supabase, Supabase prend le dessus
+    (il contient scenario_name et storage_size_bytes mis à jour).
+    """
     sb = _get_supabase()
     if not sb:
         return
@@ -319,6 +471,7 @@ def _load_jobs_from_supabase() -> None:
 
 
 def _save_job_to_disk(record: JobRecord) -> None:
+    """Sauvegarde un job sur disque (job.json) ET dans Supabase."""
     if not record.job_dir:
         return
     try:
@@ -331,6 +484,7 @@ def _save_job_to_disk(record: JobRecord) -> None:
 
 
 def _load_jobs_from_disk() -> None:
+    """Charge tous les jobs depuis le disque local dans JOB_STORE au démarrage."""
     for job_dir in sorted(JOBS_DIR.iterdir()):
         if not job_dir.is_dir():
             continue
@@ -361,6 +515,7 @@ def _load_jobs_from_disk() -> None:
 
 
 def _save_session_to_disk(record: SessionRecord) -> None:
+    """Sauvegarde l'état d'une session dans un fichier JSON sur disque."""
     try:
         session_path = SESSIONS_DIR / f"{record.session_id}.json"
         data = {
@@ -369,6 +524,7 @@ def _save_session_to_disk(record: SessionRecord) -> None:
             "current_step": record.current_step,
             "last_job_id": record.last_job_id,
             "file_meta": record.file_meta,
+            "file_path": record.file_path,
             "updated_at": record.updated_at,
         }
         with open(session_path, "w", encoding="utf-8") as fh:
@@ -378,16 +534,34 @@ def _save_session_to_disk(record: SessionRecord) -> None:
 
 
 def _load_sessions_from_disk() -> None:
+    """Charge toutes les sessions depuis le disque dans SESSION_STORE au démarrage."""
     for session_file in SESSIONS_DIR.glob("*.json"):
         try:
             with open(session_file, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
+            session_id = data["session_id"]
+            file_path = data.get("file_path")
+            # Only restore file_path if the file still exists on disk
+            if file_path and not Path(file_path).exists():
+                file_path = None
+            # Fallback: scan the session directory for any uploaded file
+            if not file_path:
+                session_dir = SESSIONS_DIR / session_id
+                if session_dir.is_dir():
+                    candidates = [
+                        p for p in session_dir.iterdir()
+                        if p.is_file() and p.suffix.lower() in (".xlsx", ".xls", ".csv")
+                    ]
+                    if candidates:
+                        # Use the most recently modified file
+                        file_path = str(max(candidates, key=lambda p: p.stat().st_mtime))
             record = SessionRecord(
-                session_id=data["session_id"],
+                session_id=session_id,
                 wizard_state=data.get("wizard_state", {}),
                 current_step=data.get("current_step", 1),
                 last_job_id=data.get("last_job_id"),
                 file_meta=data.get("file_meta", {}),
+                file_path=file_path,
                 updated_at=data.get("updated_at", ""),
             )
             SESSION_STORE[record.session_id] = record
@@ -396,6 +570,7 @@ def _load_sessions_from_disk() -> None:
 
 
 def _save_custom_kpis_to_disk() -> None:
+    """Sauvegarde tous les KPIs personnalisés dans custom_kpis.json."""
     try:
         data = [
             {
@@ -418,6 +593,7 @@ def _save_custom_kpis_to_disk() -> None:
 
 
 def _load_custom_kpis_from_disk() -> None:
+    """Charge les KPIs personnalisés depuis custom_kpis.json au démarrage."""
     if not CUSTOM_KPI_FILE.exists():
         return
     try:
@@ -461,7 +637,10 @@ _load_sessions_from_disk()
 _load_custom_kpis_from_disk()
 
 
+# ── 9. Helpers de gestion de session ──────────────────────────────────────────
+
 def _get_session_id(request: Request) -> str:
+    """Extrait le session_id depuis le header X-Session-Id, ou en génère un nouveau."""
     session_id = request.headers.get("x-session-id")
     if session_id:
         return session_id
@@ -469,6 +648,7 @@ def _get_session_id(request: Request) -> str:
 
 
 def _ensure_session(session_id: str) -> SessionRecord:
+    """Retourne la session existante ou en crée une nouvelle si absente."""
     record = SESSION_STORE.get(session_id)
     if not record:
         record = SessionRecord(session_id=session_id, updated_at=_utc_now())
@@ -477,10 +657,16 @@ def _ensure_session(session_id: str) -> SessionRecord:
 
 
 def _touch_session(record: SessionRecord) -> None:
+    """Met à jour le timestamp updated_at d'une session."""
     record.updated_at = _utc_now()
 
 
 def _save_session_file(session_id: str, upload: UploadFile) -> Path:
+    """Sauvegarde le fichier uploadé sur disque et met à jour les métadonnées de session.
+
+    Le fichier est stocké dans SESSIONS_DIR/{session_id}/{filename}.
+    Retourne le chemin complet du fichier sauvegardé.
+    """
     session_dir = SESSIONS_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
     filename = Path(upload.filename or "input.xlsx").name
@@ -492,10 +678,12 @@ def _save_session_file(session_id: str, upload: UploadFile) -> Path:
     record.file_path = str(dest_path)
     record.file_meta = {"name": filename, "size": dest_path.stat().st_size}
     _touch_session(record)
+    _save_session_to_disk(record)
     return dest_path
 
 
 def _get_session_file_path(record: SessionRecord) -> Optional[Path]:
+    """Retourne le chemin du fichier de la session, ou None s'il n'existe plus."""
     if not record.file_path:
         return None
     path = Path(record.file_path)
@@ -504,7 +692,15 @@ def _get_session_file_path(record: SessionRecord) -> Optional[Path]:
     return path
 
 
+# ── 10. Helpers de lecture des fichiers ───────────────────────────────────────
+
 def _read_excel_path(path: Path, *, nrows: Optional[int] = None) -> pd.DataFrame:
+    """Lit un fichier Excel ou CSV depuis un chemin disque.
+
+    Supporte .csv (auto-détection du séparateur), .xls et .xlsx.
+    nrows : limite le nombre de lignes lues (pour la prévisualisation).
+    Lève HTTPException 400 en cas d'erreur de lecture.
+    """
     try:
         filename = path.name.lower()
         if filename.endswith(".csv"):
@@ -529,6 +725,7 @@ def _read_excel_path(path: Path, *, nrows: Optional[int] = None) -> pd.DataFrame
         raise HTTPException(status_code=400, detail=f"Unable to read Excel file: {exc}")
 
 def _clean_mapping_value(value: object) -> Optional[str]:
+    """Nettoie une valeur de mapping : retourne None si vide, "default", "none", "null" ou "nan"."""
     if value is None:
         return None
     text = str(value).strip()
@@ -540,6 +737,12 @@ def _clean_mapping_value(value: object) -> Optional[str]:
 
 
 def _normalize_mapping_value(value: object, *, kind: Literal["category", "terminal"]) -> str:
+    """Normalise une valeur de mapping vers sa forme standard ou "IGNORER".
+
+    Pour les catégories : "W"/"WB"/"wide body" → "Wide", "N"/"NB" → "Narrow".
+    Pour les terminaux : retourne la valeur en majuscules.
+    Toute valeur "ignore"/"none"/vide → "IGNORER" (la ligne sera exclue).
+    """
     if value is None:
         return "IGNORER"
     text = str(value).strip()
@@ -563,6 +766,11 @@ def _normalize_mapping_values(
     *,
     kind: Literal["category", "terminal"],
 ) -> Dict[str, str]:
+    """Normalise toutes les clés et valeurs d'un dict de mapping.
+
+    Applique _normalize_mapping_value sur chaque entrée.
+    Pour les terminaux, les clés sont mises en majuscules.
+    """
     out: Dict[str, str] = {}
     for key, value in (mapping or {}).items():
         key_text = str(key).strip()
@@ -574,7 +782,15 @@ def _normalize_mapping_values(
     return out
 
 
+# ── 11. Helpers de parsing de la configuration ────────────────────────────────
+
 def _parse_columns_payload(payload: Dict[str, object]) -> ColumnMapping:
+    """Extrait le mapping de colonnes depuis un payload JSON (format v1 ou v2).
+
+    Format v2 (nouveau) : {"columns": {"departure_time": "...", ...}}
+    Format v1 (ancien)  : {"DepartureTime": "...", "FlightNumber": "...", ...}
+                          ou via une clé "mapping".
+    """
     if "columns" in payload:
         return ColumnMapping.parse_obj(payload.get("columns") or {})
 
@@ -601,6 +817,7 @@ def _parse_columns_payload(payload: Dict[str, object]) -> ColumnMapping:
 
 
 def _parse_makeup_config_v1(payload: Dict[str, object]) -> MakeupConfig:
+    """Parse la configuration makeup depuis le format v1 du wizard frontend."""
     mode_raw = str(payload.get("makeup_time_mode") or "").strip().lower()
     mode = "columns"
     if mode_raw in ("offsets", "compute"):
@@ -621,6 +838,12 @@ def _parse_makeup_config_v1(payload: Dict[str, object]) -> MakeupConfig:
 
 
 def _parse_carousels_config_v1(payload: Dict[str, object]) -> CarouselsConfig:
+    """Parse la configuration des carrousels depuis le format v1 du wizard frontend.
+
+    Supporte les deux formats de "carousels_by_terminal" :
+    - dict : {terminal: {carousel: {wide, narrow}}}
+    - liste : [{name, wideCapacity, narrowCapacity}]
+    """
     mode_raw = str(payload.get("carousels_mode") or "").strip().lower()
     if mode_raw in ("by_terminal_file", "by_terminal", "file"):
         mode = "file"
@@ -660,6 +883,7 @@ def _parse_carousels_config_v1(payload: Dict[str, object]) -> CarouselsConfig:
 
 
 def _parse_rules_config_v1(payload: Dict[str, object]) -> RulesConfig:
+    """Parse la configuration des règles de réajustement depuis le format v1."""
     rules_raw = payload.get("rules") or {}
     max_map = rules_raw.get("max_carousels_per_flight") or {}
 
@@ -688,6 +912,12 @@ def _parse_rules_config_v1(payload: Dict[str, object]) -> RulesConfig:
 
 
 def _parse_config_v1(payload: Dict[str, object]) -> RunConfig:
+    """Parse un payload de configuration au format "v1" (wizard frontend historique).
+
+    Le format v1 est le format plat envoyé par le wizard du frontend.
+    Il diffère du format v2 (Pydantic RunConfig direct) par les noms de clés.
+    Cette fonction le convertit en RunConfig standardisé.
+    """
     columns = _parse_columns_payload(payload)
     mapping = CategoryTerminalMapping(
         categories=_normalize_mapping_values(payload.get("category_mapping") or {}, kind="category"),
@@ -720,6 +950,13 @@ def _parse_config_v1(payload: Dict[str, object]) -> RunConfig:
     )
 
 def _parse_config(payload: str) -> RunConfig:
+    """Parse la configuration JSON envoyée par le frontend en RunConfig.
+
+    Détecte automatiquement le format :
+    - Format v2 : JSON avec clé "columns" ou "carousels" → parse directement en RunConfig.
+    - Format v1 : JSON plat du wizard → passe par _parse_config_v1.
+    Lève HTTPException 400 si le JSON est invalide.
+    """
     try:
         raw = json.loads(payload)
     except Exception as exc:
@@ -742,6 +979,10 @@ def _parse_config(payload: str) -> RunConfig:
 
 
 def _read_csv_auto(content: bytes, *, nrows: Optional[int] = None) -> pd.DataFrame:
+    """Lit un CSV en détectant automatiquement le séparateur (,  ;  tab  |).
+
+    Essaie d'abord l'auto-détection Python, puis teste chaque séparateur.
+    """
     try:
         return pd.read_csv(BytesIO(content), sep=None, engine="python", nrows=nrows)
     except Exception:
@@ -754,6 +995,7 @@ def _read_csv_auto(content: bytes, *, nrows: Optional[int] = None) -> pd.DataFra
 
 
 def _read_excel(upload: UploadFile, *, nrows: Optional[int] = None) -> pd.DataFrame:
+    """Lit un fichier uploadé (Excel ou CSV) depuis un UploadFile FastAPI."""
     try:
         content = upload.file.read()
         upload.file.seek(0)
@@ -782,6 +1024,7 @@ def _read_excel(upload: UploadFile, *, nrows: Optional[int] = None) -> pd.DataFr
 
 
 def _read_carousels_file(upload: UploadFile) -> pd.DataFrame:
+    """Lit le fichier de configuration des carrousels uploadé par l'utilisateur."""
     try:
         content = upload.file.read()
         upload.file.seek(0)
@@ -808,6 +1051,13 @@ def _read_carousels_file(upload: UploadFile) -> pd.DataFrame:
 
 
 def _apply_column_mapping(df: pd.DataFrame, mapping: ColumnMapping) -> tuple[pd.DataFrame, List[str]]:
+    """Renomme les colonnes du DataFrame selon le mapping utilisateur.
+
+    Résout chaque nom de colonne source (insensible à la casse, sans espaces doubles)
+    vers le nom standard attendu par l'allocateur.
+    Lève HTTPException 400 si une colonne requise est manquante après renommage.
+    Retourne (df_renommé, liste_des_colonnes_extra_conservées).
+    """
     def _normalize_col_name(value: object) -> str:
         return " ".join(str(value or "").strip().lower().split())
 
@@ -857,6 +1107,12 @@ def _apply_column_mapping(df: pd.DataFrame, mapping: ColumnMapping) -> tuple[pd.
 
 
 def _apply_makeup(df: pd.DataFrame, makeup: MakeupConfig) -> tuple[pd.DataFrame, List[Dict[str, object]]]:
+    """Applique la configuration makeup sur le DataFrame de vols.
+
+    En mode "columns" : vérifie que MakeupOpening/MakeupClosing existent déjà.
+    En mode "compute" : calcule les fenêtres par offset depuis DepartureTime.
+    Retourne (df_avec_makeup, warnings) où warnings liste les lignes avec dates invalides.
+    """
     warnings: List[Dict[str, object]] = []
     df_ready = df.copy()
 
@@ -897,6 +1153,7 @@ def _apply_makeup(df: pd.DataFrame, makeup: MakeupConfig) -> tuple[pd.DataFrame,
 
 
 def _build_caps_manual(config: CarouselsConfig) -> Dict[str, CarouselCapacity]:
+    """Construit le dict de capacités {nom_carrousel → CarouselCapacity} depuis le mode manual."""
     caps_manual: Dict[str, CarouselCapacity] = {}
     for name, cap in (config.manual or {}).items():
         caps_manual[str(name)] = CarouselCapacity(int(cap.wide), int(cap.narrow))
@@ -904,6 +1161,7 @@ def _build_caps_manual(config: CarouselsConfig) -> Dict[str, CarouselCapacity]:
 
 
 def _build_caps_by_terminal(config: CarouselsConfig) -> Dict[str, Dict[str, CarouselCapacity]]:
+    """Construit le dict de capacités par terminal {terminal → {carrousel → CarouselCapacity}} depuis le mode file."""
     caps_by_terminal: Dict[str, Dict[str, CarouselCapacity]] = {}
     for term, items in (config.by_terminal or {}).items():
         caps_by_terminal[str(term)] = {
@@ -914,6 +1172,12 @@ def _build_caps_by_terminal(config: CarouselsConfig) -> Dict[str, Dict[str, Caro
 
 
 def _normalize_rule_order(rules: RulesConfig) -> List[str]:
+    """Construit la liste ordonnée des règles à appliquer depuis RulesConfig.
+
+    Respecte l'ordre personnalisé de rule_order si fourni, sinon utilise
+    l'ordre par défaut : multi → narrow_wide → extras.
+    Retourne [] si apply_readjustment est False ou aucune règle activée.
+    """
     enabled: List[str] = []
     if rules.apply_readjustment:
         if rules.rule_multi:
@@ -939,6 +1203,12 @@ def _build_extra_caps(
     caps_by_terminal: Dict[str, Dict[str, CarouselCapacity]],
     caps_manual: Dict[str, CarouselCapacity],
 ) -> Dict[str, CarouselCapacity]:
+    """Construit le dict de capacités EXTRA {terminal → CarouselCapacity}.
+
+    Si des capacités EXTRA sont configurées dans ExtrasConfig → les utilise directement.
+    Sinon → déduit automatiquement depuis les capacités existantes (max wide/narrow).
+    La clé "ALL" est utilisée en mode manual (pas de multi-terminal).
+    """
     extra_caps_by_terminal = {
         str(term): CarouselCapacity(int(cap.wide), int(cap.narrow))
         for term, cap in (config.by_terminal or {}).items()
@@ -966,7 +1236,37 @@ def _build_extra_caps(
         extra_caps_by_terminal[term] = CarouselCapacity(int(wide_def), int(nar_def))
     return extra_caps_by_terminal
 
+# ── 12. Pipeline d'allocation ─────────────────────────────────────────────────
+
 def _run_allocation_pipeline(df_ready: pd.DataFrame, config: RunConfig) -> dict:
+    """Exécute le pipeline complet d'allocation sur le DataFrame de vols préparé.
+
+    Le pipeline se déroule en 3 étapes :
+
+      Étape 1 — Allocation initiale (round-robin)
+        - Mode "file" : allocation par terminal, colonnes renommées "TERMINAL-CARROUSEL"
+        - Mode "manual" : allocation globale sur tous les carrousels
+
+      Étape 2 — Réajustement (si apply_readjustment = True et règles activées)
+        - Par terminal (mode file) ou global (mode manual)
+        - Applique les règles dans l'ordre : multi, narrow_wide, extras
+
+      Étape 3 — Agrégation des résultats
+        - Construit les DataFrames de résumé des EXTRA makeups
+        - Compile les warnings
+
+    Retourne un dict avec :
+        flights_out         : résultats de l'allocation initiale
+        flights_readjusted  : résultats après réajustement
+        timeline_df         : timeline initiale
+        timeline_readjusted : timeline après réajustement
+        warnings_rows       : liste de warnings (avertissements)
+        unassigned_df       : vols non assignés
+        color_mode, *_color : paramètres de couleur pour l'export Excel
+        extra_columns       : noms des colonnes EXTRA dans la timeline
+        extra_summary_df    : résumé des EXTRA par terminal
+        extra_makeups_df    : CSV des EXTRA (Terminal, ExtraMakeupsNeeded)
+    """
     warnings_rows: List[Dict[str, object]] = []
 
     color_mode = config.colors.color_mode
@@ -1242,7 +1542,20 @@ def _run_allocation_pipeline(df_ready: pd.DataFrame, config: RunConfig) -> dict:
     }
     return results
 
+# ── 13. Calcul des KPIs et analytics ──────────────────────────────────────────
+
 def _compute_kpis(flights_readjusted: pd.DataFrame, unassigned_df: pd.DataFrame) -> Dict[str, object]:
+    """Calcule les KPIs de synthèse à afficher sur le dashboard.
+
+    KPIs calculés :
+        total_flights      : nombre total de vols
+        assigned_pct       : % de vols assignés
+        unassigned_count   : nombre de vols non assignés
+        split_count        : nombre de vols splittés sur plusieurs carrousels
+        split_pct          : % de vols splittés
+        narrow_wide_count  : nombre de vols Narrow réassignés sur Wide
+        narrow_wide_pct    : % de vols Narrow→Wide
+    """
     display_df = flights_readjusted.copy()
     total = int(len(display_df))
     unassigned_count = int(len(unassigned_df))
@@ -1274,6 +1587,14 @@ def _compute_kpis(flights_readjusted: pd.DataFrame, unassigned_df: pd.DataFrame)
 
 
 def _compute_analytics(flights_readjusted: pd.DataFrame) -> Dict[str, object]:
+    """Calcule les données analytics détaillées pour les graphiques du dashboard.
+
+    Sections calculées :
+        terminal_distribution : nb de vols par terminal
+        category_breakdown    : nb de vols assignés/non-assignés par catégorie
+        peak_hours            : distribution des départs par heure
+        carousel_breakdown    : nb de vols par carrousel et terminal
+    """
     if flights_readjusted is None or len(flights_readjusted) == 0:
         return {
             "terminal_distribution": [],
@@ -1361,6 +1682,12 @@ def _compute_analytics(flights_readjusted: pd.DataFrame) -> Dict[str, object]:
     }
 
 def _df_to_records(df: Optional[pd.DataFrame], limit: Optional[int] = None) -> List[Dict[str, object]]:
+    """Convertit un DataFrame en liste de dicts JSON-sérialisables.
+
+    Les colonnes datetime sont formatées en chaîne "YYYY-MM-DD HH:MM:SS".
+    Les valeurs NaN sont remplacées par "".
+    limit : tronque à N lignes si fourni.
+    """
     if df is None:
         return []
     out = df.copy()
@@ -1372,6 +1699,8 @@ def _df_to_records(df: Optional[pd.DataFrame], limit: Optional[int] = None) -> L
     return out.fillna("").to_dict(orient="records")
 
 
+# ── 14. Écriture des fichiers de sortie ───────────────────────────────────────
+
 def _write_outputs(
     job_dir: Path,
     results: dict,
@@ -1381,6 +1710,21 @@ def _write_outputs(
     caps_manual: Dict[str, CarouselCapacity],
     caps_by_terminal: Dict[str, Dict[str, CarouselCapacity]],
 ) -> Dict[str, str]:
+    """Écrit tous les fichiers de résultats dans le répertoire du job.
+
+    Fichiers créés :
+        summary.txt / summary.csv                 : résultats bruts de l'allocation
+        summary_readjusted.txt / .csv             : résultats après réajustement
+        timeline.xlsx                             : planning initial coloré
+        timeline_readjusted.xlsx                  : planning après réajustement
+        heatmap_positions_occupied.xlsx           : positions occupées
+        heatmap_positions_free.xlsx               : positions libres
+        extra_makeups_needed.csv                  : nb de zones EXTRA par terminal
+        warnings.csv                              : liste des avertissements
+        unassigned_reasons.csv                    : vols non assignés avec raison
+
+    Retourne un dict {clé_download → nom_fichier} utilisé pour construire les URLs.
+    """
     flights_out = results["flights_out"]
     flights_readjusted = results["flights_readjusted"]
     timeline_df = results["timeline_df"]
@@ -1481,8 +1825,11 @@ def _write_outputs(
     }
     return downloads
 
+# ── 15. Endpoints de l'outil d'allocation ─────────────────────────────────────
+
 @app.get("/")
 def root() -> RedirectResponse:
+    """Redirige vers /app (frontend) si disponible, sinon vers /docs (Swagger)."""
     if FRONTEND_DIR.exists():
         return RedirectResponse(url="/app")
     return RedirectResponse(url="/docs")
@@ -1494,6 +1841,12 @@ def preview(
     response: Response,
     file: Optional[UploadFile] = File(None),
 ):
+    """Lit les premières lignes du fichier de vols et suggère le mapping de colonnes.
+
+    Utilisé à l'étape 1 du wizard pour afficher l'aperçu et les suggestions.
+    Si file est absent, utilise le fichier déjà uploadé dans la session.
+    Retourne : colonnes, aperçu des 10 premières lignes, suggestions de mapping.
+    """
     session_id = _get_session_id(request)
     record = _ensure_session(session_id)
     response.headers["X-Session-Id"] = session_id
@@ -1535,6 +1888,11 @@ def inspect(
     config_json: Optional[str] = Form(None),
     config: Optional[str] = Form(None),
 ):
+    """Retourne les valeurs uniques de Category et Terminal après application du mapping de colonnes.
+
+    Utilisé à l'étape 2 du wizard pour afficher les valeurs brutes à mapper.
+    Requiert config_json avec au moins le mapping de colonnes.
+    """
     session_id = _get_session_id(request)
     record = _ensure_session(session_id)
     response.headers["X-Session-Id"] = session_id
@@ -1551,11 +1909,14 @@ def inspect(
 
     columns_cfg = _parse_columns_payload(payload)
 
+    print(f"[INSPECT] session_id={session_id[:8]}... file_uploaded={file is not None} record.file_path={record.file_path!r}")
+
     if file is not None:
         path = _save_session_file(session_id, file)
         df_raw = _read_excel_path(path)
     else:
         path = _get_session_file_path(record)
+        print(f"[INSPECT] resolved path={path}")
         if not path:
             raise HTTPException(status_code=400, detail="Missing file for inspect")
         df_raw = _read_excel_path(path)
@@ -1571,6 +1932,7 @@ def inspect(
 
 @app.get("/api/session/state")
 def get_session_state(request: Request, response: Response):
+    """Retourne l'état courant de la session (étape du wizard, paramètres, dernier job)."""
     session_id = _get_session_id(request)
     record = _ensure_session(session_id)
     response.headers["X-Session-Id"] = session_id
@@ -1589,6 +1951,7 @@ def set_session_state(
     request: Request,
     response: Response,
 ):
+    """Sauvegarde l'état du wizard dans la session (étape courante et paramètres)."""
     session_id = _get_session_id(request)
     record = _ensure_session(session_id)
     response.headers["X-Session-Id"] = session_id
@@ -1610,6 +1973,11 @@ def set_session_state(
 
 @app.post("/api/carousels/validate")
 def validate_carousels(file: UploadFile = File(...)):
+    """Valide et lit un fichier de configuration des carrousels (Excel/CSV).
+
+    Détecte automatiquement les colonnes Terminal, CarouselName, WideCapacity, NarrowCapacity.
+    Retourne la liste des carrousels détectés ou une liste d'erreurs si le fichier est invalide.
+    """
     df = _read_carousels_file(file)
     cols = list(df.columns)
     if not cols:
@@ -1669,6 +2037,11 @@ def validate_carousels(file: UploadFile = File(...)):
 
 
 def _compute_input_analytics(df: pd.DataFrame) -> dict:
+    """Calcule les statistiques descriptives du fichier de vols AVANT allocation.
+
+    Utilisé pour enrichir les analytics du job avec des données d'entrée :
+    plage de dates, distribution par heure, par catégorie, par terminal.
+    """
     result: dict = {
         "total_flights": len(df),
         "date_range": {"min": "", "max": ""},
@@ -1709,6 +2082,21 @@ def run(
     config: Optional[str] = Form(None),
     scenario_name: Optional[str] = Form(None),
 ):
+    """Lance un run d'allocation complet et retourne les résultats.
+
+    Flux d'exécution :
+      1. Parse la configuration JSON
+      2. Lit le fichier Excel (uploadé ou depuis la session)
+      3. Applique le mapping de colonnes, catégories, terminaux
+      4. Calcule les fenêtres makeup si nécessaire
+      5. Exécute le pipeline d'allocation (_run_allocation_pipeline)
+      6. Écrit les fichiers de sortie (_write_outputs)
+      7. Calcule les KPIs et analytics
+      8. Persiste le job sur disque + Supabase
+
+    Retourne le job complet avec KPIs, analytics, URLs de téléchargement, tables.
+    scenario_name : nom optionnel pour identifier le run dans l'historique.
+    """
     session_id = _get_session_id(request)
     record_session = _ensure_session(session_id)
     response.headers["X-Session-Id"] = session_id
@@ -1817,10 +2205,11 @@ def run(
         raise HTTPException(status_code=500, detail=f"Allocation failed: {exc}")
 
 
-# ── Custom KPI endpoints ────────────────────────────────────────────────────
+# ── 16. Endpoints KPI personnalisés ───────────────────────────────────────────
 
 @app.get("/api/kpis")
 def list_custom_kpis():
+    """Retourne la liste de tous les KPIs personnalisés triés par date de création."""
     kpis = sorted(CUSTOM_KPI_STORE.values(), key=lambda k: k.created_at)
     return [
         {
@@ -1840,6 +2229,7 @@ def list_custom_kpis():
 
 @app.post("/api/kpis")
 def create_custom_kpi(payload: CustomKPIPayload):
+    """Crée un nouveau KPI personnalisé et le persiste sur disque."""
     if not payload.name.strip():
         raise HTTPException(status_code=400, detail="Le nom du KPI est requis.")
     if not payload.metric.strip():
@@ -1873,6 +2263,7 @@ def create_custom_kpi(payload: CustomKPIPayload):
 
 @app.delete("/api/kpis/{kpi_id}")
 def delete_custom_kpi(kpi_id: str):
+    """Supprime un KPI personnalisé par son ID."""
     if kpi_id not in CUSTOM_KPI_STORE:
         raise HTTPException(status_code=404, detail="KPI non trouve.")
     del CUSTOM_KPI_STORE[kpi_id]
@@ -1880,7 +2271,7 @@ def delete_custom_kpi(kpi_id: str):
     return {"ok": True}
 
 
-# ── Admin / migration endpoints ─────────────────────────────────────────────
+# ── 17. Endpoints admin ───────────────────────────────────────────────────────
 
 @app.post("/api/admin/migrate")
 def admin_migrate():
@@ -1900,10 +2291,11 @@ def admin_migrate():
     return {"ok": True, "pushed": pushed, "errors": errors}
 
 
-# ── Job list / detail endpoints ─────────────────────────────────────────────
+# ── 18. Endpoints jobs ────────────────────────────────────────────────────────
 
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str):
+    """Supprime un job : depuis Supabase, depuis le disque, et de la mémoire."""
     record = JOB_STORE.get(job_id)
     if not record:
         raise HTTPException(status_code=404, detail="Job non trouve.")
@@ -1928,6 +2320,7 @@ def delete_job(job_id: str):
 
 @app.get("/api/jobs")
 def list_jobs(limit: int = 100):
+    """Retourne la liste des jobs terminés, triés du plus récent au plus ancien."""
     done_jobs = [r for r in JOB_STORE.values() if r.status == "done"]
     done_jobs.sort(key=lambda r: r.created_at or "", reverse=True)
     done_jobs = done_jobs[:limit]
@@ -1948,6 +2341,7 @@ def list_jobs(limit: int = 100):
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
+    """Retourne les détails complets d'un job (KPIs, analytics, warnings, downloads)."""
     record = JOB_STORE.get(job_id)
     if not record:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1969,6 +2363,10 @@ def get_job(job_id: str):
 
 @app.get("/api/jobs/{job_id}/download/{filename}")
 def download(job_id: str, filename: str):
+    """Télécharge un fichier de résultats d'un job (Excel, CSV, TXT).
+
+    Le nom du fichier est sécurisé (Path().name) pour éviter les traversals.
+    """
     record = JOB_STORE.get(job_id)
     if not record or not record.job_dir:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1983,6 +2381,11 @@ def download(job_id: str, filename: str):
 
 @app.get("/api/jobs/{job_id}/preview/{filename}")
 def preview_result(job_id: str, filename: str, limit: int = 50, offset: int = 0):
+    """Prévisualise un fichier CSV de résultats (paginé).
+
+    Disponible uniquement pour les fichiers .csv.
+    limit/offset : pagination des lignes retournées.
+    """
     record = JOB_STORE.get(job_id)
     if not record or not record.job_dir:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -2009,9 +2412,29 @@ def preview_result(job_id: str, filename: str, limit: int = 50, offset: int = 0)
     }
 
 
-# ─── Mapping Tool ─────────────────────────────────────────────────────────────
+# ── 19. Outil de mapping ───────────────────────────────────────────────────────
+#
+# L'outil de mapping est une fonctionnalité DISTINCTE de l'allocation.
+# Il permet de transformer un fichier Excel/CSV :
+#   - Sélectionner/renommer des colonnes
+#   - Calculer de nouvelles colonnes via des formules Excel-like (formula_engine.py)
+#   - Filtrer les lignes (avec groupes AND/OR)
+#   - Joindre des fichiers secondaires (LEFT JOIN)
+#   - Dédupliquer par clé primaire avec agrégation
+#
+# Endpoints : /api/mapping/sheets, /api/mapping/columns, /api/mapping/preview, /api/mapping/execute
 
 class MappingColumnDef(BaseModel):
+    """Définition d'une colonne de sortie dans l'outil de mapping.
+
+    target_name       : nom de la colonne dans le fichier de sortie
+    source_col        : colonne source (si pas de formule)
+    formula           : formule Excel-like (ex: =CONCATENER(A;B)) — prioritaire sur source_col
+    is_pk             : si True, les lignes avec cette colonne vide sont exclues
+    aggregation       : mode d'agrégation en cas de dédup (First, Sum, Count, Concat…)
+    format            : format d'affichage pour les dates (Auto, Date, DateTime, Time)
+    include_in_output : si False, la colonne est calculée mais pas incluse dans l'export
+    """
     target_name: str
     source_col: str = ""
     formula: str = ""
@@ -2025,8 +2448,14 @@ class MappingColumnDef(BaseModel):
 
 
 class MappingFilterRule(BaseModel):
+    """Règle de filtre sur une colonne du fichier source ou de sortie.
+
+    col : nom de la colonne
+    op  : opérateur (=, <>, >, <, >=, <=, contains, not_contains, starts_with, ends_with, is_empty, is_not_empty)
+    val : valeur de comparaison (ignorée pour is_empty/is_not_empty)
+    """
     col: str
-    op: str  # "=", "<>", ">", "<", ">=", "<=", "contains", "not_contains", "starts_with", "ends_with", "is_empty", "is_not_empty"
+    op: str
     val: str = ""
 
     class Config:
@@ -2034,6 +2463,14 @@ class MappingFilterRule(BaseModel):
 
 
 class JoinConfig(BaseModel):
+    """Configuration d'un LEFT JOIN avec un fichier secondaire.
+
+    alias         : nom préfixe pour les colonnes du fichier secondaire (ex: "sec" → "sec.ColName")
+    on_primary    : colonne de jointure dans le fichier principal
+    on_secondary  : colonne de jointure dans le fichier secondaire
+    sheet_name    : onglet Excel à lire (optionnel)
+    skip_rows     : nombre de lignes à sauter en début de fichier
+    """
     alias: str
     on_primary: str
     on_secondary: str
@@ -2045,6 +2482,11 @@ class JoinConfig(BaseModel):
 
 
 class FilterGroup(BaseModel):
+    """Groupe de règles de filtre combinées par AND ou OR.
+
+    Les groupes eux-mêmes sont toujours combinés entre eux par AND.
+    Exemple : (A=1 OR B=2) AND (C>10) → deux groupes.
+    """
     id: str = ""
     op: Literal["AND", "OR"] = "AND"
     rules: List[MappingFilterRule] = []
@@ -2054,6 +2496,18 @@ class FilterGroup(BaseModel):
 
 
 class MappingExecuteConfig(BaseModel):
+    """Configuration complète d'un run de l'outil de mapping.
+
+    columns              : liste des colonnes de sortie à calculer
+    filter_groups        : filtres sur les données SOURCE (avant calcul des formules)
+    filters              : filtres plats (rétrocompatibilité, utilisé si filter_groups vide)
+    output_filter_groups : filtres sur les données DE SORTIE (après calcul, après dédup)
+    output_filters       : filtres de sortie plats (rétrocompatibilité)
+    dedup_by_pk          : si True, déduplique sur la colonne clé primaire (is_pk=True)
+    output_format        : "csv" ou "excel"
+    joins                : liste des LEFT JOINs avec fichiers secondaires
+    sheet_name, skip_rows: options de lecture du fichier source
+    """
     columns: List[MappingColumnDef]
     filters: List[MappingFilterRule] = []
     output_filters: List[MappingFilterRule] = []
@@ -2078,6 +2532,11 @@ def _read_df_from_bytes(
     skip_rows: int = 0,
     nrows: Optional[int] = None,
 ) -> pd.DataFrame:
+    """Lit un fichier (Excel ou CSV) depuis des bytes en mémoire.
+
+    Supporte .csv, .xls et .xlsx. Utilisé pour le Mapping Tool qui reçoit
+    les fichiers en mémoire sans les sauvegarder sur disque.
+    """
     fn = (filename or "").lower()
     if fn.endswith(".csv"):
         return _read_csv_auto(content, nrows=nrows)
@@ -2107,7 +2566,13 @@ from formula_engine import (
 
 
 def _get_filter_mask(df: pd.DataFrame, f: "MappingFilterRule") -> "pd.Series":
-    """Return a boolean mask for a single filter rule."""
+    """Calcule le masque booléen pour une règle de filtre sur un DataFrame.
+
+    Retourne une Series de booléens (True = ligne conservée).
+    Si la colonne n'existe pas → retourne True pour toutes les lignes (filtre ignoré).
+    Pour les comparaisons numériques (>, <, >=, <=), utilise pd.to_numeric.
+    Pour = et <>, tente la comparaison numérique d'abord, puis texte insensible à la casse.
+    """
     if f.col not in df.columns:
         return pd.Series([True] * len(df), index=df.index)
     col = df[f.col]
@@ -2149,7 +2614,10 @@ def _get_filter_mask(df: pd.DataFrame, f: "MappingFilterRule") -> "pd.Series":
 
 
 def _apply_filters(df: pd.DataFrame, filters: list) -> pd.DataFrame:
-    """Apply flat AND filter list (backward compat)."""
+    """Applique une liste plate de filtres (tous combinés par AND).
+
+    Rétrocompatibilité : utilisé quand filter_groups est vide.
+    """
     if not filters:
         return df
     mask = pd.Series([True] * len(df), index=df.index)
@@ -2159,8 +2627,11 @@ def _apply_filters(df: pd.DataFrame, filters: list) -> pd.DataFrame:
 
 
 def _apply_filter_groups(df: pd.DataFrame, groups: list) -> pd.DataFrame:
-    """Apply grouped filters: rules within a group combined by group.op (AND/OR),
-    groups themselves combined with AND."""
+    """Applique des groupes de filtres sur un DataFrame.
+
+    Au sein d'un groupe, les règles sont combinées par group.op (AND ou OR).
+    Les groupes eux-mêmes sont toujours combinés entre eux par AND.
+    """
     if not groups:
         return df
     mask = pd.Series([True] * len(df), index=df.index)
@@ -2179,6 +2650,19 @@ def _apply_filter_groups(df: pd.DataFrame, groups: list) -> pd.DataFrame:
 
 
 def _run_mapping(df_src: pd.DataFrame, config: "MappingExecuteConfig", secondary_dfs: Optional[Dict[str, "pd.DataFrame"]] = None) -> pd.DataFrame:
+    """Exécute la transformation de mapping complète sur un DataFrame source.
+
+    Étapes dans l'ordre :
+      1. Filtres source (filter_groups ou filters) — filtre avant calcul
+      2. LEFT JOINs avec les fichiers secondaires (préfixe "alias.ColName")
+      3. Calcul des colonnes de sortie (formules, valeurs fixes ou colonnes source)
+         Les colonnes déjà calculées sont disponibles pour les formules suivantes.
+      4. Exclusion des lignes avec clé primaire vide (si is_pk=True sur une colonne)
+      5. Déduplication sur la clé primaire avec agrégation (si dedup_by_pk=True)
+      6. Filtres de sortie (output_filter_groups ou output_filters) — filtre après calcul
+
+    Retourne le DataFrame de sortie (colonnes include_in_output=True uniquement).
+    """
     if config.filter_groups:
         df_src = _apply_filter_groups(df_src, config.filter_groups)
     elif config.filters:
@@ -2272,6 +2756,7 @@ def _run_mapping(df_src: pd.DataFrame, config: "MappingExecuteConfig", secondary
 
 @app.post("/api/mapping/sheets")
 def mapping_get_sheets(file: UploadFile = File(...)):
+    """Retourne la liste des onglets d'un fichier Excel. Retourne [] pour les CSV."""
     content = file.file.read()
     fn = (file.filename or "").lower()
     if fn.endswith(".csv"):
@@ -2290,6 +2775,7 @@ def mapping_get_columns(
     sheet_name: Optional[str] = Form(default=None),
     skip_rows: int = Form(default=0),
 ):
+    """Retourne les colonnes et le nombre de lignes d'un fichier (pour le wizard de mapping)."""
     content = file.file.read()
     try:
         df = _read_df_from_bytes(
@@ -2308,6 +2794,11 @@ def mapping_preview(
     secondary_files: Optional[List[UploadFile]] = File(default=None),
     config_json: str = Form(...),
 ):
+    """Exécute le mapping et retourne un aperçu des 100 premières lignes (sans téléchargement).
+
+    Utilisé par le wizard de mapping pour prévisualiser le résultat avant export.
+    secondary_files : fichiers secondaires pour les LEFT JOINs (dans l'ordre des joins).
+    """
     try:
         config = MappingExecuteConfig(**json.loads(config_json))
     except Exception as exc:
@@ -2370,6 +2861,12 @@ def mapping_execute(
     secondary_files: Optional[List[UploadFile]] = File(default=None),
     config_json: str = Form(...),
 ):
+    """Exécute le mapping complet et retourne le fichier de sortie en téléchargement.
+
+    output_format "csv"   → retourne un fichier CSV (UTF-8 with BOM pour Excel).
+    output_format "excel" → retourne un fichier .xlsx.
+    secondary_files : fichiers secondaires pour les LEFT JOINs (dans l'ordre des joins).
+    """
     try:
         config = MappingExecuteConfig(**json.loads(config_json))
     except Exception as exc:

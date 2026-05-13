@@ -3,16 +3,20 @@
 import { useEffect, useState } from "react"
 import { useParams, useRouter } from "next/navigation"
 import {
-  ArrowRight, BarChart3, CheckCircle2, Clock,
-  HardDrive, Loader2, Plane, Plus, XCircle,
+  ArrowLeft, ArrowRight, BarChart3, CheckCircle2, Clock,
+  HardDrive, Loader2, Plane, Plus, Trash2, XCircle,
 } from "lucide-react"
 import Link from "next/link"
 
 import { AppShell } from "@/components/app-shell"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent } from "@/components/ui/card"
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from "@/components/ui/dialog"
 import { supabase, type AllocationRun, type Scenario } from "@/lib/supabase"
+import { toast } from "sonner"
 
 function formatDate(iso: string | null) {
   if (!iso) return "—"
@@ -44,6 +48,10 @@ export default function AllocationPage() {
   const [runs, setRuns] = useState<AllocationRun[]>([])
   const [loading, setLoading] = useState(true)
 
+  const [deleteRunId, setDeleteRunId] = useState<string | null>(null)
+  const [deleteScenarioOpen, setDeleteScenarioOpen] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+
   useEffect(() => { load() }, [scenarioId])
 
   async function load() {
@@ -57,8 +65,33 @@ export default function AllocationPage() {
     setLoading(false)
   }
 
-  function startNewRun() {
-    router.push(`/wizard?scenarioId=${scenarioId}`)
+  async function handleDeleteRun() {
+    if (!deleteRunId) return
+    setDeleting(true)
+    const { error } = await supabase.from("allocation_runs").delete().eq("id", deleteRunId)
+    setDeleting(false)
+    setDeleteRunId(null)
+    if (error) {
+      toast.error("Erreur lors de la suppression du run")
+    } else {
+      toast.success("Run supprimé")
+      setRuns(prev => prev.filter(r => r.id !== deleteRunId))
+    }
+  }
+
+  async function handleDeleteScenario() {
+    setDeleting(true)
+    // Delete runs first, then scenario
+    await supabase.from("allocation_runs").delete().eq("scenario_id", scenarioId)
+    const { error } = await supabase.from("scenarios").delete().eq("id", scenarioId)
+    setDeleting(false)
+    setDeleteScenarioOpen(false)
+    if (error) {
+      toast.error("Erreur lors de la suppression du scénario")
+    } else {
+      toast.success("Scénario supprimé")
+      router.push("/")
+    }
   }
 
   if (loading) {
@@ -77,6 +110,14 @@ export default function AllocationPage() {
         {/* Header */}
         <div className="mb-8 flex items-start justify-between">
           <div>
+            {/* Back button */}
+            <button
+              onClick={() => router.push(`/scenario/${scenarioId}`)}
+              className="mb-3 flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <ArrowLeft className="h-3.5 w-3.5" />
+              Retour au scénario
+            </button>
             <div className="mb-1 flex items-center gap-2 text-sm text-muted-foreground">
               <Plane className="h-4 w-4 text-primary" />
               Make-up Allocation · {scenario?.name}
@@ -87,13 +128,22 @@ export default function AllocationPage() {
             </p>
           </div>
           <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setDeleteScenarioOpen(true)}
+              className="gap-2 text-destructive hover:text-destructive"
+            >
+              <Trash2 className="h-4 w-4" />
+              Supprimer le scénario
+            </Button>
             <Button variant="outline" size="sm" asChild>
               <Link href={`/scenario/${scenarioId}/analyse`}>
                 <BarChart3 className="mr-2 h-4 w-4" />
                 Analyse
               </Link>
             </Button>
-            <Button onClick={startNewRun}>
+            <Button onClick={() => router.push(`/wizard?scenarioId=${scenarioId}`)}>
               <Plus className="mr-2 h-4 w-4" />
               Nouveau run
             </Button>
@@ -109,7 +159,7 @@ export default function AllocationPage() {
               <p className="mb-5 text-sm text-muted-foreground">
                 Lancez l&apos;assistant pour configurer et exécuter votre première allocation.
               </p>
-              <Button onClick={startNewRun}>
+              <Button onClick={() => router.push(`/wizard?scenarioId=${scenarioId}`)}>
                 <Plane className="mr-2 h-4 w-4" />
                 Lancer l&apos;assistant
                 <ArrowRight className="ml-2 h-4 w-4" />
@@ -133,7 +183,7 @@ export default function AllocationPage() {
                       <p className="text-xs text-muted-foreground">{formatDate(run.created_at)}</p>
                     </div>
                   </div>
-                  <div className="flex items-center gap-6">
+                  <div className="flex items-center gap-4">
                     {run.kpis && (
                       <div className="hidden gap-5 text-right sm:flex">
                         <div>
@@ -158,6 +208,14 @@ export default function AllocationPage() {
                         </Link>
                       </Button>
                     )}
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
+                      onClick={() => setDeleteRunId(run.id)}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
                   </div>
                 </CardContent>
               </Card>
@@ -165,6 +223,48 @@ export default function AllocationPage() {
           </div>
         )}
       </div>
+
+      {/* Dialog: supprimer un run */}
+      <Dialog open={!!deleteRunId} onOpenChange={(open) => { if (!open) setDeleteRunId(null) }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Supprimer ce run ?</DialogTitle>
+            <DialogDescription>
+              Cette action est irréversible. Le run sera définitivement supprimé.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteRunId(null)} disabled={deleting}>
+              Annuler
+            </Button>
+            <Button variant="destructive" onClick={handleDeleteRun} disabled={deleting}>
+              {deleting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
+              Supprimer
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Dialog: supprimer le scénario */}
+      <Dialog open={deleteScenarioOpen} onOpenChange={setDeleteScenarioOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Supprimer le scénario &quot;{scenario?.name}&quot; ?</DialogTitle>
+            <DialogDescription>
+              Cette action est irréversible. Le scénario et tous ses runs ({runs.length}) seront définitivement supprimés.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteScenarioOpen(false)} disabled={deleting}>
+              Annuler
+            </Button>
+            <Button variant="destructive" onClick={handleDeleteScenario} disabled={deleting}>
+              {deleting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
+              Supprimer le scénario
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </AppShell>
   )
 }

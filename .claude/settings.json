@@ -54,13 +54,22 @@
       "Bash(Get-ChildItem \"c:\\\\Users\\\\ASA\\\\Desktop\\\\perso\\\\projects\\\\carousel-allocation-tool\\\\storage\\\\sessions\" -ErrorAction SilentlyContinue)",
       "Bash(Select-Object Name, Length, LastWriteTime)",
       "Bash(Format-Table)",
-      "PowerShell(python \"c:\\\\Users\\\\ASA\\\\Desktop\\\\perso\\\\projects\\\\carousel-allocation-tool\\\\_cleanup_api.py\")"
+      "PowerShell(python \"c:\\\\Users\\\\ASA\\\\Desktop\\\\perso\\\\projects\\\\carousel-allocation-tool\\\\_cleanup_api.py\")",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import api_app; print\\('api_app OK'\\)\")",
+      "Bash(python -m uvicorn api_app:app --port 8099 --host 127.0.0.1)",
+      "Bash(curl -s http://127.0.0.1:8099/)",
+      "Bash(dir /s /b app\\\\*.tsx)",
+      "Bash(findstr page.tsx)",
+      "Bash(Find c:\\\\Users\\\\ASA\\\\Desktop\\\\perso\\\\projects\\\\carousel-allocation-tool/app -type f -name \"*.tsx\" -o -name \"*.ts\")",
+      "Bash(.venv\\\\Scripts\\\\python.exe -c \"import polars as pl; print\\(pl.__version__\\)\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\ASA\\Desktop\\perso\\projects\\carousel-allocation-tool\\app\\projet\\[projetId]",
       "c:\\Users\\ASA\\Desktop\\perso\\projects\\carousel-allocation-tool\\app\\entreprise",
       "c:\\Users\\ASA\\Desktop\\perso\\projects\\carousel-allocation-tool\\app\\secteur",
-      "C:\\Users\\ASA\\Downloads"
+      "C:\\Users\\ASA\\Downloads",
+      "c:\\Users\\ASA\\.claude\\projects\\c--Users-ASA-Desktop-perso-projects-carousel-allocation-tool\\memory"
     ]
   }
 }

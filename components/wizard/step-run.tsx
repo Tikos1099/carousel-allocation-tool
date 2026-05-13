@@ -6,16 +6,19 @@ import type { WizardState } from "@/app/wizard/page"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
 
 interface StepRunProps {
   state: WizardState
+  updateState: (updates: Partial<WizardState>) => void
   isRunning: boolean
   onRun: () => void
   onPrevious: () => void
 }
 
-export function StepRun({ state, isRunning, onRun, onPrevious }: StepRunProps) {
+export function StepRun({ state, updateState, isRunning, onRun, onPrevious }: StepRunProps) {
   const configSummary = [
     {
       label: "Fichier",
@@ -56,6 +59,18 @@ export function StepRun({ state, isRunning, onRun, onPrevious }: StepRunProps) {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
+        {/* Run name */}
+        <div className="space-y-2">
+          <Label htmlFor="runName">Nom du run (optionnel)</Label>
+          <Input
+            id="runName"
+            placeholder="ex: Scenario hiver 2040, Test capacite T2..."
+            value={state.runName}
+            onChange={(e) => updateState({ runName: e.target.value })}
+            disabled={isRunning}
+          />
+        </div>
+
         {/* Config summary */}
         <div className="rounded-lg border bg-muted/30 p-4">
           <h4 className="mb-4 font-medium">Resume de la configuration</h4>

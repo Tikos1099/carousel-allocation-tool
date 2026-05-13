@@ -1,0 +1,4 @@
+FlightNumber,Category,Positions,DepartureTime,MakeupOpening,MakeupClosing,Terminal
+AF001,Wide,20,2024-01-01 08:00,2024-01-01 05:00,2024-01-01 07:30,T1
+AF002,Narrow,10,2024-01-01 09:00,2024-01-01 06:00,2024-01-01 08:30,T1
+AF003,Wide,15,2024-01-01 10:00,2024-01-01 07:00,2024-01-01 09:30,T1

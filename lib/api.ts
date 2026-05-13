@@ -26,6 +26,7 @@ export interface AllocationConfig {
   }[]
   rules: {
     applyReadjustment: boolean
+    wideCanUseNarrow: boolean
     ruleMulti: boolean
     ruleNarrowWide: boolean
     ruleExtras: boolean
@@ -287,7 +288,7 @@ function buildConfigPayload(config: AllocationConfig) {
       rule_narrow_wide: config.rules.ruleNarrowWide,
       rule_extras: config.rules.ruleExtras,
       rule_order: config.rules.ruleOrder || [],
-      wide_can_use_narrow: true,
+      wide_can_use_narrow: config.rules.wideCanUseNarrow ?? true,
       narrow_can_use_wide: config.rules.ruleNarrowWide,
       max_carousels_per_flight: {
         Wide: Number(config.rules.maxCarouselsWide || 1),
